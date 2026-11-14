@@ -91,9 +91,10 @@ pub async fn list_objects(
 ) -> Result<Vec<ObjectInfo>> {
     let mut patterns = Vec::new();
     let narrow = like_sql(like, "c.relname::text", &mut patterns, 1);
-    // Partitions are skipped: they will appear under their parent table.
+    // Partitions are skipped: they will appear under their parent table. `is not true`, not
+    // `not`: CockroachDB leaves `relispartition` NULL, and `not NULL` would skip every table.
     let sql = format!(
-        "{OBJECTS_SQL} and n.nspname = $1 and not c.relispartition{narrow} order by c.relname"
+        "{OBJECTS_SQL} and n.nspname = $1 and c.relispartition is not true{narrow} order by c.relname"
     );
     let rows = client
         .query(&sql, &query_params(&[schema], &patterns))
@@ -111,7 +112,7 @@ pub async fn list_columns(client: &Client, schema: &str) -> Result<Vec<SchemaCol
              join pg_class c on c.oid = a.attrelid
              join pg_namespace n on n.oid = c.relnamespace
              where n.nspname = $1 and c.relkind in ('r', 'p', 'v', 'm', 'f')
-               and not c.relispartition and a.attnum > 0 and not a.attisdropped
+               and c.relispartition is not true and a.attnum > 0 and not a.attisdropped
              order by c.relname, a.attnum",
             &[&schema],
         )
@@ -292,7 +293,7 @@ pub async fn list_referencing_keys(
              from pg_constraint con
              join pg_class c on c.oid = con.conrelid
              join pg_namespace n on n.oid = c.relnamespace
-             where con.contype = 'f' and not c.relispartition
+             where con.contype = 'f' and c.relispartition is not true
                and con.confrelid = (select t.oid from pg_class t
                                     join pg_namespace tn on tn.oid = t.relnamespace
                                     where tn.nspname = $1 and t.relname = $2)

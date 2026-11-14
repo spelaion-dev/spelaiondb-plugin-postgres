@@ -23,3 +23,4 @@ jobs:
       # are skipped there, saying so.
       test-env: |
         SPELAION_TEST_PG=127.0.0.1:15432
+        SPELAION_TEST_COCKROACH=127.0.0.1:26257

@@ -4,6 +4,9 @@
 # below: only `spelaion_gis` has the extension, so the `spelaion` database's catalog is the
 # same as on plain PostgreSQL. Published on 127.0.0.1:15432 (SPELAION_TEST_PG).
 # `testing/gen-keys.sh` makes the certificates first.
+#
+# CockroachDB, which speaks PostgreSQL's protocol and is reached through this plugin
+# (SpelaionDB's SDB-169), on 127.0.0.1:26257 (SPELAION_TEST_COCKROACH), as its image starts.
 name: spelaiondb-plugin-postgres-test
 
 services:
@@ -37,3 +40,13 @@ services:
       test: ["CMD-SHELL", "pg_isready -U spelaion -d spelaion"]
       interval: 2s
       retries: 30
+
+  cockroachdb:
+    image: cockroachdb/cockroach:v24.3.37
+    command: ["start-single-node", "--insecure"]
+    ports:
+      - "127.0.0.1:26257:26257"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/health?ready=1"]
+      interval: 2s
+      retries: 60

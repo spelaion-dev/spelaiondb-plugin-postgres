@@ -88,28 +88,40 @@ pub async fn list_schema_objects(
         .collect()
 }
 
+/// Roles, tablespaces and extensions. `{location}` is a tablespace's folder on the server.
+const SERVER_OBJECTS_SQL: &str = "select rolname::text, 'role', \
+            nullif(concat_ws(', ', case when rolsuper then 'SUPERUSER' end, \
+                             case when rolcanlogin then 'LOGIN' end, \
+                             case when rolcreatedb then 'CREATEDB' end, \
+                             case when rolcreaterole then 'CREATEROLE' end, \
+                             case when rolreplication then 'REPLICATION' end), ''), \
+            rolname ~ '^pg_' \
+     from pg_roles \
+     union all \
+     select spcname::text, 'tablespace', {location}, false \
+     from pg_tablespace \
+     union all \
+     select e.extname::text, 'extension', e.extversion || ' · ' || n.nspname, false \
+     from pg_extension e join pg_namespace n on n.oid = e.extnamespace \
+     order by 2, 1";
+
+/// SQLSTATE `undefined_function`.
+const UNDEFINED_FUNCTION: &str = "42883";
+
 pub async fn list_server_objects(client: &Client) -> Result<Vec<ServerObject>> {
-    let rows = client
-        .query(
-            "select rolname::text, 'role', \
-                    nullif(concat_ws(', ', case when rolsuper then 'SUPERUSER' end, \
-                                     case when rolcanlogin then 'LOGIN' end, \
-                                     case when rolcreatedb then 'CREATEDB' end, \
-                                     case when rolcreaterole then 'CREATEROLE' end, \
-                                     case when rolreplication then 'REPLICATION' end), ''), \
-                    rolname ~ '^pg_' \
-             from pg_roles \
-             union all \
-             select spcname::text, 'tablespace', nullif(pg_tablespace_location(oid), ''), false \
-             from pg_tablespace \
-             union all \
-             select e.extname::text, 'extension', e.extversion || ' · ' || n.nspname, false \
-             from pg_extension e join pg_namespace n on n.oid = e.extnamespace \
-             order by 2, 1",
-            &[],
-        )
-        .await
-        .map_err(map_error)?;
+    let with_location =
+        SERVER_OBJECTS_SQL.replace("{location}", "nullif(pg_tablespace_location(oid), '')");
+    let rows = match client.query(&with_location, &[]).await {
+        Ok(rows) => rows,
+        // Servers that speak PostgreSQL's protocol without its tablespaces on disk
+        // (CockroachDB) have no `pg_tablespace_location`: their tablespaces are listed
+        // without a folder.
+        Err(e) if e.code().is_some_and(|c| c.code() == UNDEFINED_FUNCTION) => client
+            .query(&SERVER_OBJECTS_SQL.replace("{location}", "null::text"), &[])
+            .await
+            .map_err(map_error)?,
+        Err(e) => return Err(map_error(e)),
+    };
     rows.iter()
         .map(|r| {
             let kind: String = r.get(1);
