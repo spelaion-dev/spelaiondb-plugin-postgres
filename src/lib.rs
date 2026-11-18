@@ -6,6 +6,7 @@
 
 mod ddl;
 mod decode;
+mod details;
 use spelaion_dialect::postgres as dialect;
 mod introspect;
 mod objects;
@@ -18,10 +19,11 @@ use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use spelaion_driver_api::{
-    CancelHandle, Capabilities, ColumnMeta, ColumnOrigin, ConnectParams, Connection, Dialect,
-    Driver, DriverError, EventStream, ExecEvent, ExecOptions, InsertTarget, KeepAlive, LikeFilter,
-    NameFilter, Notice, ObjectInfo, ReferencingKey, Result, ResultSchema, SchemaColumn, SchemaInfo,
-    SchemaObject, ServerObject, TableInfo, TextRows, TransactionState,
+    CancelHandle, Capabilities, ColumnMeta, ColumnOrigin, ConnectParams, Connection, Dependencies,
+    Dialect, Driver, DriverError, EventStream, ExecEvent, ExecOptions, InsertTarget, KeepAlive,
+    LikeFilter, NameFilter, Notice, ObjectInfo, ObjectProperty, Partitioning, ReferencingKey,
+    Result, ResultSchema, SchemaColumn, SchemaInfo, SchemaObject, ServerObject, TableInfo,
+    TextRows, TransactionState,
 };
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::{FromSql, Type};
@@ -405,6 +407,18 @@ impl Connection for PgConnection {
 
     async fn relation_definition(&self, schema: &str, name: &str) -> Result<String> {
         ddl::relation_definition(&self.client, schema, name).await
+    }
+
+    async fn object_properties(&self, schema: &str, name: &str) -> Result<Vec<ObjectProperty>> {
+        details::properties(&self.client, schema, name).await
+    }
+
+    async fn table_partitions(&self, schema: &str, name: &str) -> Result<Option<Partitioning>> {
+        details::partitions(&self.client, schema, name).await
+    }
+
+    async fn object_dependencies(&self, schema: &str, name: &str) -> Result<Option<Dependencies>> {
+        details::dependencies(&self.client, schema, name).await
     }
 
     async fn procedure_call(&self, object: &SchemaObject) -> Result<String> {

@@ -702,6 +702,176 @@ async fn explorer_lists_the_other_objects_of_a_schema() {
     }
 }
 
+/// Runs `body`, then `cleanup` even when the body panicked: the test servers are shared, and
+/// what a failed run leaves behind breaks other tests (SpelaionDB's `tests/support`'s
+/// `cleaning_up`). The cleanup is best effort; the body's own failure is the one reported.
+async fn cleaning_up<T, C>(
+    body: impl std::future::Future<Output = T>,
+    cleanup: impl FnOnce() -> C,
+) -> T
+where
+    C: std::future::Future<Output = ()>,
+{
+    use futures_util::FutureExt;
+    let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+    cleanup().await;
+    match outcome {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// A relation's properties, partitions and dependencies (SpelaionDB's SDB-393), read from
+/// the catalog.
+#[tokio::test]
+async fn object_details_are_read_from_the_catalog() {
+    let Some(conn) = connect().await else { return };
+    let schema = format!("spelaion_details_{}", std::process::id());
+    let drop = format!("drop schema if exists {schema} cascade");
+    cleaning_up(details_on(&*conn, &schema), || async {
+        let _ = run(&*conn, &drop).await;
+    })
+    .await;
+}
+
+async fn details_on(conn: &dyn Connection, schema: &str) {
+    let setup = [
+        format!("drop schema if exists {schema} cascade"),
+        format!("create schema {schema}"),
+        format!(
+            "create table {schema}.customer (id serial primary key, email text) with (fillfactor = 70)"
+        ),
+        format!(
+            "create table {schema}.orders (id int, customer_id int references {schema}.customer (id),              at date not null) partition by range (at)"
+        ),
+        format!(
+            "create table {schema}.orders_2025 partition of {schema}.orders              for values from ('2025-01-01') to ('2026-01-01')"
+        ),
+        format!("create table {schema}.orders_rest partition of {schema}.orders default"),
+        format!("create view {schema}.customer_emails as select email from {schema}.customer"),
+        format!(
+            "create materialized view {schema}.customer_count as select count(*) from {schema}.customer_emails"
+        ),
+        format!(
+            "create function {schema}.touch() returns trigger language plpgsql as              $$ begin return new; end $$"
+        ),
+        format!(
+            "create trigger customer_touch before update on {schema}.customer              for each row execute function {schema}.touch()"
+        ),
+    ];
+    for stmt in &setup {
+        run(conn, stmt)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e:?}"));
+    }
+
+    let properties: Vec<String> = conn
+        .object_properties(schema, "customer")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| format!("{}={}", p.name, p.value))
+        .collect();
+    assert_eq!(
+        properties,
+        [
+            "owner=spelaion",
+            "tablespace=pg_default",
+            "engine=heap",
+            "persistence=permanent",
+            "options=fillfactor=70",
+        ]
+    );
+    // A partitioned table keeps no rows of its own: it has no access method.
+    let partitioned: Vec<String> = conn
+        .object_properties(schema, "orders")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert!(
+        !partitioned.contains(&"engine".to_string()),
+        "{partitioned:?}"
+    );
+    assert!(conn.object_properties(schema, "nope").await.is_err());
+
+    let partitioning = conn
+        .table_partitions(schema, "orders")
+        .await
+        .unwrap()
+        .expect("partitioned");
+    assert_eq!(
+        (partitioning.method.as_str(), partitioning.key.as_str()),
+        ("range", "at")
+    );
+    let partitions: Vec<(String, Option<String>)> = partitioning
+        .partitions
+        .iter()
+        .map(|p| (p.name.clone(), p.bound.clone()))
+        .collect();
+    assert_eq!(
+        partitions,
+        [
+            (
+                "orders_2025".to_string(),
+                Some("FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')".to_string())
+            ),
+            ("orders_rest".to_string(), Some("DEFAULT".to_string())),
+        ]
+    );
+    assert_eq!(
+        conn.table_partitions(schema, "customer").await.unwrap(),
+        None
+    );
+
+    let line = |d: &spelaion_driver_api::DependencyInfo| format!("{:?} {}", d.kind, d.name);
+    let customer = conn
+        .object_dependencies(schema, "customer")
+        .await
+        .unwrap()
+        .expect("PostgreSQL records them");
+    assert_eq!(
+        customer.uses.iter().map(line).collect::<Vec<_>>(),
+        ["Sequence customer_id_seq"]
+    );
+    assert_eq!(
+        customer.used_by.iter().map(line).collect::<Vec<_>>(),
+        [
+            "View customer_emails",
+            "ForeignKey orders",
+            "Trigger customer_touch"
+        ]
+    );
+    assert_eq!(
+        customer.untracked,
+        [spelaion_driver_api::DependencyKind::Function]
+    );
+    let view = conn
+        .object_dependencies(schema, "customer_emails")
+        .await
+        .unwrap()
+        .expect("told");
+    assert_eq!(
+        view.uses.iter().map(line).collect::<Vec<_>>(),
+        ["Table customer"]
+    );
+    assert_eq!(
+        view.used_by.iter().map(line).collect::<Vec<_>>(),
+        ["MaterializedView customer_count"]
+    );
+    let orders = conn
+        .object_dependencies(schema, "orders")
+        .await
+        .unwrap()
+        .expect("told");
+    assert_eq!(
+        orders.uses.iter().map(line).collect::<Vec<_>>(),
+        ["Table customer"]
+    );
+    assert!(conn.object_dependencies(schema, "nope").await.is_err());
+}
+
 #[tokio::test]
 async fn server_version_is_reported() {
     let Some(conn) = connect().await else { return };
