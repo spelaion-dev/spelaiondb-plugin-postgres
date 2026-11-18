@@ -205,10 +205,7 @@ where
         .await
         .map_err(|_| Error::closed())?;
 
-    match responses.next().await? {
-        Message::BindComplete => {}
-        _ => return Err(Error::unexpected_message()),
-    }
+    query::bind_complete(&mut responses, &statement).await?;
 
     match responses.next().await? {
         Message::CopyInResponse(_) => {}

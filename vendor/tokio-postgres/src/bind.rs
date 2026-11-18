@@ -3,7 +3,6 @@ use crate::codec::FrontendMessage;
 use crate::connection::RequestMessages;
 use crate::types::BorrowToSql;
 use crate::{Error, Portal, Statement, query};
-use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,10 +28,7 @@ where
 
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
-    match responses.next().await? {
-        Message::BindComplete => {}
-        _ => return Err(Error::unexpected_message()),
-    }
+    query::bind_complete(&mut responses, &statement).await?;
 
     Ok(Portal::new(client, name, statement))
 }

@@ -18,6 +18,9 @@ says only what is different in this repository.
   definitions.
 - `src/bin/spelaiondb-plugin-postgres.rs`: the program. It hands the driver to
   `spelaion_plugin_sdk::run` and nothing else.
+- Behind a pooler in transaction mode (the core's option `pooler = transaction`), the
+  client is told to use unnamed statements only (`vendor/tokio-postgres/PATCHED.md`), and the
+  driver sets nothing for the session. `tests/pgbouncer.rs` runs it through PgBouncer.
 - `tests/postgres.rs`: the type zoo against a real server (`tests/snapshots`). **A new type
   is added there first.** `tests/conformance.rs`: SpelaionDB's conformance set against this
   program, and `plugin.toml` checked against what the program says of itself.

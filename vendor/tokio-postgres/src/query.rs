@@ -51,7 +51,7 @@ where
     } else {
         encode(client, &statement, params)?
     };
-    let responses = start(client, buf).await?;
+    let responses = start(client, buf, &statement).await?;
     Ok(RowStream {
         statement,
         responses,
@@ -226,7 +226,7 @@ where
     } else {
         encode(client, &statement, params)?
     };
-    let mut responses = start(client, buf).await?;
+    let mut responses = start(client, buf, &statement).await?;
 
     let mut rows = 0;
     loop {
@@ -242,15 +242,25 @@ where
     }
 }
 
-async fn start(client: &InnerClient, buf: Bytes) -> Result<Responses, Error> {
+async fn start(client: &InnerClient, buf: Bytes, statement: &Statement) -> Result<Responses, Error> {
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
-
-    match responses.next().await? {
-        Message::BindComplete => {}
-        _ => return Err(Error::unexpected_message()),
-    }
-
+    bind_complete(&mut responses, statement).await?;
     Ok(responses)
+}
+
+/// The answer to a Bind of `statement`: ParseComplete first when its Parse was sent again
+/// (SpelaionDB's patch), then BindComplete.
+pub(crate) async fn bind_complete(responses: &mut Responses, statement: &Statement) -> Result<(), Error> {
+    if statement.parse().is_some() {
+        match responses.next().await? {
+            Message::ParseComplete => {}
+            _ => return Err(Error::unexpected_message()),
+        }
+    }
+    match responses.next().await? {
+        Message::BindComplete => Ok(()),
+        _ => Err(Error::unexpected_message()),
+    }
 }
 
 pub fn encode<P, I>(client: &InnerClient, statement: &Statement, params: I) -> Result<Bytes, Error>
@@ -281,6 +291,11 @@ where
     let params = params.into_iter();
     if params.len() != statement.params().len() {
         return Err(Error::parameters(params.len(), statement.params().len()));
+    }
+    // SpelaionDB's patch: the unnamed statement is parsed again in this batch, so the Bind
+    // that follows finds it on whichever server connection runs the batch.
+    if let Some(parse) = statement.parse() {
+        buf.extend_from_slice(parse);
     }
 
     encode_bind_raw(

@@ -14,17 +14,13 @@ pub async fn copy_out(client: &InnerClient, statement: Statement) -> Result<Copy
     debug!("executing copy out statement {}", statement.name());
 
     let buf = query::encode(client, &statement, slice_iter(&[]))?;
-    let responses = start(client, buf).await?;
+    let responses = start(client, buf, &statement).await?;
     Ok(CopyOutStream { responses })
 }
 
-async fn start(client: &InnerClient, buf: Bytes) -> Result<Responses, Error> {
+async fn start(client: &InnerClient, buf: Bytes, statement: &Statement) -> Result<Responses, Error> {
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
-
-    match responses.next().await? {
-        Message::BindComplete => {}
-        _ => return Err(Error::unexpected_message()),
-    }
+    query::bind_complete(&mut responses, statement).await?;
 
     match responses.next().await? {
         Message::CopyOutResponse(_) => {}
