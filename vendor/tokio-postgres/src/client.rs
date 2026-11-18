@@ -92,12 +92,20 @@ pub struct InnerClient {
     transaction_status: Arc<AtomicU8>,
     pending_requests: Arc<AtomicUsize>,
     cached_typeinfo: Mutex<CachedTypeInfo>,
+    /// SpelaionDB's patch: statements are prepared unnamed and parsed again in the same
+    /// message batch as each Bind (see `Client::set_unnamed_statements`).
+    unnamed_statements: std::sync::atomic::AtomicBool,
 
     /// A buffer to use when writing out postgres commands.
     buffer: Mutex<BytesMut>,
 }
 
 impl InnerClient {
+    /// Whether statements are prepared unnamed (SpelaionDB's patch).
+    pub(crate) fn unnamed_statements(&self) -> bool {
+        self.unnamed_statements.load(Ordering::SeqCst)
+    }
+
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
         let (sender, receiver) = mpsc::channel(1);
         let request = Request { messages, sender };
@@ -211,6 +219,7 @@ impl Client {
                 transaction_status,
                 pending_requests,
                 cached_typeinfo: Default::default(),
+                unnamed_statements: Default::default(),
                 buffer: Default::default(),
             }),
             #[cfg(feature = "runtime")]
@@ -228,6 +237,17 @@ impl Client {
             return None;
         }
         Some(self.inner.transaction_status.load(Ordering::SeqCst))
+    }
+
+    /// SpelaionDB's patch, for a server reached through a pooler in transaction mode
+    /// (PgBouncer's `pool_mode = transaction`), where two transactions of this client may run
+    /// on two server connections. When on, a statement is prepared as the unnamed statement
+    /// (to learn its parameter and column types) and every use of it sends its Parse again in
+    /// the same message batch as its Bind, before the batch's Sync: each use is complete on
+    /// whichever server connection runs it, and no named statement is ever left on a server
+    /// connection. Set it before the first statement is prepared.
+    pub fn set_unnamed_statements(&self, on: bool) {
+        self.inner.unnamed_statements.store(on, Ordering::SeqCst);
     }
 
     pub(crate) fn inner(&self) -> &Arc<InnerClient> {

@@ -10,6 +10,9 @@ struct StatementInner {
     name: String,
     params: Vec<Type>,
     columns: Vec<Column>,
+    /// SpelaionDB's patch: the Parse message of an unnamed statement, sent again before each
+    /// of its Binds (`Client::set_unnamed_statements`).
+    parse: Option<bytes::Bytes>,
 }
 
 impl Drop for StatementInner {
@@ -47,7 +50,24 @@ impl Statement {
             name,
             params,
             columns,
+            parse: None,
         }))
+    }
+
+    /// An unnamed statement whose `parse` message is sent again before each Bind.
+    pub(crate) fn reparsed(parse: bytes::Bytes, params: Vec<Type>, columns: Vec<Column>) -> Statement {
+        Statement(Arc::new(StatementInner {
+            client: Weak::new(),
+            name: String::new(),
+            params,
+            columns,
+            parse: Some(parse),
+        }))
+    }
+
+    /// The Parse message sent before each Bind of this statement, if it has one.
+    pub(crate) fn parse(&self) -> Option<&bytes::Bytes> {
+        self.0.parse.as_ref()
     }
 
     pub(crate) fn unnamed(params: Vec<Type>, columns: Vec<Column>) -> Statement {
@@ -56,6 +76,7 @@ impl Statement {
             name: String::new(),
             params,
             columns,
+            parse: None,
         }))
     }
 

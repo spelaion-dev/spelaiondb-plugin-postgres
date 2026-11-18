@@ -63,7 +63,13 @@ pub async fn prepare(
     query: &str,
     types: &[Type],
 ) -> Result<Statement, Error> {
-    let name = format!("s{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
+    // SpelaionDB's patch: behind a pooler in transaction mode, the unnamed statement only.
+    let unnamed = client.unnamed_statements();
+    let name = if unnamed {
+        String::new()
+    } else {
+        format!("s{}", NEXT_ID.fetch_add(1, Ordering::SeqCst))
+    };
     let buf = encode(client, &name, query, types)?;
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 
@@ -106,6 +112,16 @@ pub async fn prepare(
         }
     }
 
+    if unnamed {
+        // Parsed again with the types the server described, so each Bind reads its values
+        // as this Describe said it would.
+        let parse = client.with_buf(|buf| {
+            frontend::parse("", query, parameters.iter().map(Type::oid), buf)
+                .map_err(Error::encode)?;
+            Ok::<_, Error>(buf.split().freeze())
+        })?;
+        return Ok(Statement::reparsed(parse, parameters, columns));
+    }
     Ok(Statement::new(client, name, parameters, columns))
 }
 

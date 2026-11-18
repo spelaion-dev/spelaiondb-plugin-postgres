@@ -91,6 +91,13 @@ impl Driver for PostgresDriver {
             }
         };
 
+        // Behind a pooler in transaction mode (SpelaionDB's SDB-396), two transactions may run
+        // on two server connections: no named prepared statement is relied on (each use sends
+        // its Parse with its Bind). Nothing else of the session is set by this driver.
+        if transaction_pooled(params) {
+            client.set_unnamed_statements(true);
+        }
+
         let cancel = Arc::new(PgCancel {
             token: client.cancel_token(),
             host: params.host.clone(),
@@ -114,6 +121,12 @@ impl Driver for PostgresDriver {
             },
         }))
     }
+}
+
+/// The core's option for a pooler (`pooler`): `transaction` for PgBouncer's transaction mode.
+/// Any other value, or none, is a direct connection or a pooler that keeps the session.
+fn transaction_pooled(params: &ConnectParams) -> bool {
+    params.options.get("pooler").map(String::as_str) == Some("transaction")
 }
 
 struct PgConnection {
