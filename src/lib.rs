@@ -6,11 +6,13 @@
 
 mod ddl;
 mod decode;
+mod execution;
 use spelaion_dialect::postgres as dialect;
 mod introspect;
 mod objects;
 mod tls;
 
+use execution::{Execution, Order};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -78,16 +80,16 @@ impl Driver for PostgresDriver {
         // The connection is driven in its own task; server notices (NOTICE, WARNING…) are
         // kept and delivered at the end of each statement.
         let notices = Arc::new(Mutex::new(Vec::new()));
-        let client = match &tls {
+        let (client, backend) = match &tls {
             Some(tls) => {
                 let (client, connection) = config.connect(tls.clone()).await.map_err(map_error)?;
-                tokio::spawn(drive(connection, notices.clone()));
-                client
+                let backend = tokio::spawn(drive(connection, notices.clone()));
+                (client, backend.abort_handle())
             }
             None => {
                 let (client, connection) = config.connect(NoTls).await.map_err(map_error)?;
-                tokio::spawn(drive(connection, notices.clone()));
-                client
+                let backend = tokio::spawn(drive(connection, notices.clone()));
+                (client, backend.abort_handle())
             }
         };
 
@@ -100,6 +102,8 @@ impl Driver for PostgresDriver {
 
         let cancel = Arc::new(PgCancel {
             token: client.cancel_token(),
+            backend,
+            order: Arc::new(Order::default()),
             host: params.host.clone(),
             port: params.port,
             connect_addr: params.connect_addr,
@@ -204,6 +208,10 @@ impl PgConnection {
             .collect()
     }
 
+    async fn lock_sql(&self) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        self.cancel.order.lock(&self.client).await
+    }
+
     /// Streams the rows of a prepared statement, with `params` bound to it.
     async fn stream(
         &self,
@@ -211,6 +219,7 @@ impl PgConnection {
         statement: tokio_postgres::Statement,
         params: Vec<String>,
         opts: &ExecOptions,
+        execution: Execution,
     ) -> Result<EventStream> {
         let types: Vec<Type> = statement
             .columns()
@@ -236,6 +245,7 @@ impl PgConnection {
                 })
                 .collect(),
         ));
+        execution.check()?;
         let rows = self
             .client
             .query_raw(&statement, params.iter().map(String::as_str))
@@ -265,10 +275,11 @@ impl PgConnection {
                     pending = 0;
                 }
             }
+            let drained: Vec<Notice> = std::mem::take(&mut *notices.lock().expect("notices lock poisoned"));
+            drop(execution);
             if pending > 0 {
                 yield ExecEvent::Batch(finish_batch(&schema, &mut builders)?);
             }
-            let drained: Vec<Notice> = std::mem::take(&mut *notices.lock().expect("notices lock poisoned"));
             for notice in drained {
                 yield ExecEvent::Notice(notice);
             }
@@ -285,9 +296,7 @@ impl Connection for PgConnection {
     }
 
     async fn execute(&self, sql: &str, opts: &ExecOptions) -> Result<EventStream> {
-        refuse_copy_stdio(sql)?;
-        let statement = self.client.prepare(sql).await.map_err(map_error)?;
-        self.stream(sql, statement, Vec::new(), opts).await
+        self.execute_bound(sql, Vec::new(), opts).await
     }
 
     /// Every parameter is declared `text`: the SQL casts it where it needs another type.
@@ -298,13 +307,16 @@ impl Connection for PgConnection {
         opts: &ExecOptions,
     ) -> Result<EventStream> {
         refuse_copy_stdio(sql)?;
+        let execution = self.cancel.order.start(&self.client).await?;
+        execution.check()?;
         let types = vec![Type::TEXT; params.len()];
         let statement = self
             .client
             .prepare_typed(sql, &types)
             .await
             .map_err(map_error)?;
-        self.stream(sql, statement, params, opts).await
+        execution.check()?;
+        self.stream(sql, statement, params, opts, execution).await
     }
 
     fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
@@ -312,6 +324,7 @@ impl Connection for PgConnection {
     }
 
     async fn keep_alive(&self) -> Result<KeepAlive> {
+        let _permit = self.lock_sql().await?;
         match self.transaction_state().await? {
             TransactionState::Idle => {}
             TransactionState::Open | TransactionState::Failed => {
@@ -330,7 +343,7 @@ impl Connection for PgConnection {
         // A dropped prepared statement may still be awaiting its close response: wait for
         // the protocol to settle rather than treating that transient state as a transaction.
         loop {
-            if self.client.is_closed() {
+            if self.is_closed() {
                 return Err(DriverError::Connection("the connection is closed".into()));
             }
             match self.client.transaction_status() {
@@ -343,10 +356,11 @@ impl Connection for PgConnection {
     }
 
     fn is_closed(&self) -> bool {
-        self.client.is_closed()
+        self.cancel.order.failed() || self.client.is_closed()
     }
 
     async fn server_version(&self) -> Result<String> {
+        let _permit = self.lock_sql().await?;
         let row = self
             .client
             .query_one("select current_setting('server_version')", &[])
@@ -356,15 +370,18 @@ impl Connection for PgConnection {
     }
 
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>> {
+        let _permit = self.lock_sql().await?;
         introspect::list_schemas(&self.client, &LikeFilter::default()).await
     }
 
     async fn list_objects(&self, schema: &str) -> Result<Vec<ObjectInfo>> {
+        let _permit = self.lock_sql().await?;
         introspect::list_objects(&self.client, schema, &LikeFilter::default()).await
     }
 
     // Narrowed in the catalog query, then matched exactly (ADR-025).
     async fn list_schemas_matching(&self, filter: &NameFilter) -> Result<Vec<SchemaInfo>> {
+        let _permit = self.lock_sql().await?;
         let mut schemas = introspect::list_schemas(&self.client, &filter.server_side()).await?;
         schemas.retain(|s| filter.matches(&s.name));
         Ok(schemas)
@@ -375,6 +392,7 @@ impl Connection for PgConnection {
         schema: &str,
         filter: &NameFilter,
     ) -> Result<Vec<ObjectInfo>> {
+        let _permit = self.lock_sql().await?;
         let mut objects =
             introspect::list_objects(&self.client, schema, &filter.server_side()).await?;
         objects.retain(|o| filter.matches(&o.name));
@@ -386,6 +404,7 @@ impl Connection for PgConnection {
         schema: &str,
         filter: &NameFilter,
     ) -> Result<Vec<SchemaObject>> {
+        let _permit = self.lock_sql().await?;
         let mut objects =
             objects::list_schema_objects(&self.client, schema, &filter.server_side()).await?;
         objects.retain(|o| filter.matches(&o.name));
@@ -393,34 +412,42 @@ impl Connection for PgConnection {
     }
 
     async fn describe_table(&self, schema: &str, name: &str) -> Result<TableInfo> {
+        let _permit = self.lock_sql().await?;
         introspect::describe_table(&self.client, schema, name).await
     }
 
     async fn list_columns(&self, schema: &str) -> Result<Vec<SchemaColumn>> {
+        let _permit = self.lock_sql().await?;
         introspect::list_columns(&self.client, schema).await
     }
 
     async fn list_referencing_keys(&self, schema: &str, name: &str) -> Result<Vec<ReferencingKey>> {
+        let _permit = self.lock_sql().await?;
         introspect::list_referencing_keys(&self.client, schema, name).await
     }
 
     async fn list_schema_objects(&self, schema: &str) -> Result<Vec<SchemaObject>> {
+        let _permit = self.lock_sql().await?;
         objects::list_schema_objects(&self.client, schema, &LikeFilter::default()).await
     }
 
     async fn list_server_objects(&self) -> Result<Vec<ServerObject>> {
+        let _permit = self.lock_sql().await?;
         objects::list_server_objects(&self.client).await
     }
 
     async fn object_definition(&self, object: &SchemaObject) -> Result<String> {
+        let _permit = self.lock_sql().await?;
         objects::object_definition(&self.client, object).await
     }
 
     async fn relation_definition(&self, schema: &str, name: &str) -> Result<String> {
+        let _permit = self.lock_sql().await?;
         ddl::relation_definition(&self.client, schema, name).await
     }
 
     async fn procedure_call(&self, object: &SchemaObject) -> Result<String> {
+        let _permit = self.lock_sql().await?;
         objects::procedure_call(&self.client, object).await
     }
 
@@ -430,6 +457,8 @@ impl Connection for PgConnection {
         if rows.is_empty() {
             return Ok(0);
         }
+        let execution = self.cancel.order.start(&self.client).await?;
+        execution.check()?;
         let sql = copy_sql(target, &PostgresDialect);
         let sink = self
             .client
@@ -571,8 +600,11 @@ fn finish_batch(
 }
 
 /// Cancellation opens a new connection, which must use the same TLS as the original.
+#[derive(Clone)]
 struct PgCancel {
     token: CancelToken,
+    backend: tokio::task::AbortHandle,
+    order: Arc<Order>,
     /// The server's name (TLS checks it) and port, and where the session's connection went
     /// instead when it goes through a tunnel (its local end).
     host: String,
@@ -587,11 +619,51 @@ const CANCEL_CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 #[async_trait]
 impl CancelHandle for PgCancel {
-    /// Returns once the server has closed the cancel connection, which it does after it has
-    /// signalled the session's backend: a cancel that has returned can no longer stop a
-    /// statement sent after it (SDB-266). tokio-postgres's own `cancel_query` returns as soon
-    /// as the request is written.
+    /// Report the first request's outcome to the caller. Retries outlive this future,
+    /// and keep the execution permit until the last request is acknowledged.
     async fn cancel(&self) -> Result<()> {
+        let Some(active) = self.order.cancel() else {
+            return Ok(());
+        };
+        let cancel = self.clone();
+        let (sender, reply) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut reply = Some(sender);
+            while !active.finished() {
+                let result = cancel.send_request().await;
+                let failed = result.is_err();
+                if failed {
+                    // A request might still reach the server after a send error or timeout.
+                    // Close this backend before letting work reach it again.
+                    cancel.order.fail();
+                    cancel.backend.abort();
+                }
+                if let Some(reply) = reply.take() {
+                    let _ = reply.send(result);
+                }
+                if failed {
+                    return;
+                }
+                if !active.finished() {
+                    tokio::time::sleep(RETRY_CANCEL_EVERY).await;
+                }
+            }
+            if let Some(reply) = reply {
+                let _ = reply.send(Ok(()));
+            }
+        });
+        reply
+            .await
+            .map_err(|_| DriverError::Connection("the cancel task stopped".into()))?
+    }
+}
+
+const RETRY_CANCEL_EVERY: Duration = Duration::from_millis(20);
+
+impl PgCancel {
+    /// The server closes the cancel connection after signalling the backend (SDB-266).
+    /// Wait for that close; tokio-postgres alone waits only until the request is written.
+    async fn send_request(&self) -> Result<()> {
         let failed = |e: String| DriverError::Connection(format!("cancelling: {e}"));
         let connect = async {
             match self.connect_addr {
