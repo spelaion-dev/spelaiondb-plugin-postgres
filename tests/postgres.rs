@@ -5,8 +5,7 @@
 //! `SPELAION_TEST_PG=127.0.0.1:15432 cargo test`. Without the variable they are skipped
 //! with a notice.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use spelaion_driver_api::{
@@ -380,19 +379,82 @@ async fn errors_carry_code_and_position() {
 }
 
 #[tokio::test]
-async fn cancel_stops_a_running_query() {
-    let Some(conn) = connect().await else { return };
-    let conn: Arc<dyn Connection> = Arc::from(conn);
+async fn cancel_stops_queries_starting_or_running_without_tls() {
+    if test_addr().is_none() {
+        return;
+    }
+    let conn = connect_tls("127.0.0.1", TlsMode::Disable, None)
+        .await
+        .expect("plain PostgreSQL connection");
+    check_early_and_running_cancel(&*conn).await;
+}
+
+async fn check_early_and_running_cancel(conn: &dyn Connection) {
+    use std::task::Poll;
+
     let cancel = conn.cancel_handle();
-    let canceller = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        cancel.cancel().await
-    });
-    let started = Instant::now();
-    let result = run(&*conn, "select pg_sleep(30)").await;
-    canceller.await.unwrap().unwrap();
-    assert!(matches!(result, Err(DriverError::Cancelled)), "{result:?}");
-    assert!(started.elapsed() < Duration::from_secs(10));
+    let opts = ExecOptions::default();
+    let wait = Duration::from_secs(10);
+
+    // Poll only as far as the first pending I/O. The driver's preparation is now in
+    // flight, but it cannot advance to sending the prepared execution until polled again.
+    tokio::time::timeout(wait, async {
+        let mut preparation = std::pin::pin!(conn.execute("select pg_sleep(30)", &opts));
+        assert!(matches!(
+            futures_util::poll!(&mut preparation),
+            Poll::Pending
+        ));
+        cancel.cancel().await.unwrap();
+        assert!(matches!(preparation.await, Err(DriverError::Cancelled)));
+        assert_eq!(
+            first_row(conn, "select 1 as after_prepare_cancel").await[0].3,
+            "1"
+        );
+    })
+    .await
+    .expect("cancel during preparation");
+
+    // The driver has submitted the execution, but there is no need to wait for the
+    // server to start it or for the consumer to begin reading its stream.
+    tokio::time::timeout(wait, async {
+        let stream = conn
+            .execute_bound(
+                "select repeat('x', 1024) from generate_series(1, 128) as n,
+                 lateral pg_sleep(case when n = 128 then $1::float8 else 0 end)",
+                vec!["30".into()],
+                &opts,
+            )
+            .await
+            .unwrap();
+        cancel.cancel().await.unwrap();
+        let result: Result<Vec<_>, _> = stream.try_collect().await;
+        assert!(matches!(result, Err(DriverError::Cancelled)), "{result:?}");
+    })
+    .await
+    .expect("cancel at execution submission");
+
+    tokio::time::timeout(wait, async {
+        let (result, ack) = tokio::join!(run(conn, "select pg_sleep(30)"), async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            cancel.cancel().await
+        });
+        ack.unwrap();
+        assert!(matches!(result, Err(DriverError::Cancelled)), "{result:?}");
+        // A retry for the cancelled command must not hit this query.
+        assert_eq!(first_row(conn, "select 1 as after_cancel").await[0].3, "1");
+    })
+    .await
+    .expect("cancel while a query runs");
+
+    tokio::time::timeout(wait, async {
+        cancel.cancel().await.unwrap();
+        assert_eq!(
+            first_row(conn, "select 1 as after_idle_cancel").await[0].3,
+            "1"
+        );
+    })
+    .await
+    .expect("cancel while idle");
 }
 
 #[tokio::test]
@@ -817,23 +879,14 @@ async fn tls_modes_behave_like_libpq() {
 }
 
 #[tokio::test]
-async fn cancel_works_over_tls() {
+async fn cancel_stops_queries_starting_or_running_over_tls() {
     if test_addr().is_none() {
         return;
     }
-    let conn: Arc<dyn Connection> = Arc::from(
-        connect_tls("127.0.0.1", TlsMode::Require, None)
-            .await
-            .expect("TLS connection"),
-    );
-    let cancel = conn.cancel_handle();
-    let canceller = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        cancel.cancel().await
-    });
-    let result = run(&*conn, "select pg_sleep(30)").await;
-    canceller.await.unwrap().unwrap();
-    assert!(matches!(result, Err(DriverError::Cancelled)), "{result:?}");
+    let conn = connect_tls("127.0.0.1", TlsMode::Require, None)
+        .await
+        .expect("TLS connection");
+    check_early_and_running_cancel(&*conn).await;
 }
 
 fn test_key(name: &str) -> std::path::PathBuf {
