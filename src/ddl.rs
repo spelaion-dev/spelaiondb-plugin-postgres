@@ -18,7 +18,75 @@ pub async fn relation_definition(
     match catalog {
         Catalog::PostgreSql => postgres_definition(client, schema, name).await,
         Catalog::RisingWave => risingwave_definition(client, schema, name).await,
+        Catalog::Materialize => materialize_definition(client, schema, name).await,
     }
+}
+
+/// Materialize writes each object's statement itself (`SHOW CREATE`), sources included, which
+/// `pg_class` lists as tables: which statement to ask for comes from `mz_objects`, then the
+/// relation's indexes. `SHOW` takes no parameters, so the name in it is quoted by the server
+/// (`quote_ident`) and the kind is one of ours.
+async fn materialize_definition(client: &Client, schema: &str, name: &str) -> Result<String> {
+    let read = |what: &str, e: tokio_postgres::Error| {
+        DriverError::Other(format!("reading {schema}.{name}'s {what}: {e}"))
+    };
+    let row = client
+        .query_opt(
+            "select o.id, o.type, quote_ident(s.name) || '.' || quote_ident(o.name)
+             from mz_catalog.mz_objects o
+             join mz_catalog.mz_schemas s on s.id = o.schema_id
+             join mz_catalog.mz_databases d on d.id = s.database_id
+             where d.name = current_database() and s.name = $1 and o.name = $2
+               and o.type in ('table', 'source', 'view', 'materialized-view')",
+            &[&schema, &name],
+        )
+        .await
+        .map_err(map_error)?
+        .ok_or_else(|| DriverError::Other(format!("{schema}.{name} does not exist")))?;
+    let id: String = row.try_get(0).map_err(|e| read("id", e))?;
+    let kind: String = row.try_get(1).map_err(|e| read("kind", e))?;
+    let qualified: String = row.try_get(2).map_err(|e| read("name", e))?;
+    let statement = match kind.as_str() {
+        "table" => "TABLE",
+        "source" => "SOURCE",
+        "view" => "VIEW",
+        "materialized-view" => "MATERIALIZED VIEW",
+        other => {
+            return Err(DriverError::Other(format!(
+                "{schema}.{name} is a {other}, which has no definition here"
+            )));
+        }
+    };
+    let mut statements = vec![show_create(client, statement, &qualified).await?];
+    let indexes = client
+        .query(
+            "select quote_ident(s.name) || '.' || quote_ident(i.name)
+             from mz_catalog.mz_indexes i
+             join mz_catalog.mz_objects io on io.id = i.id
+             join mz_catalog.mz_schemas s on s.id = io.schema_id
+             where i.on_id = $1
+             order by i.name",
+            &[&id],
+        )
+        .await
+        .map_err(map_error)?;
+    for row in indexes {
+        let index: String = row.try_get(0).map_err(|e| read("index", e))?;
+        statements.push(show_create(client, "INDEX", &index).await?);
+    }
+    Ok(statements.join("\n\n"))
+}
+
+/// `SHOW CREATE <what> <qualified>`'s statement: its second column.
+async fn show_create(client: &Client, what: &str, qualified: &str) -> Result<String> {
+    let row = client
+        .query_one(&format!("SHOW CREATE {what} {qualified}"), &[])
+        .await
+        .map_err(map_error)?;
+    let sql: String = row
+        .try_get(1)
+        .map_err(|e| DriverError::Other(format!("reading SHOW CREATE {what}: {e}")))?;
+    Ok(terminated(&sql))
 }
 
 /// RisingWave keeps each relation's statement as it was written (`rw_catalog.rw_relations`),
