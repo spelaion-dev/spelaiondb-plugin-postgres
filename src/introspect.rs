@@ -58,13 +58,48 @@ pub async fn list_schemas(client: &Client, like: &LikeFilter) -> Result<Vec<Sche
         .collect())
 }
 
-const OBJECTS_SQL: &str = r"
-    select n.nspname::text, c.relname::text, c.relkind::text,
-           case when c.reltuples < 0 then null else c.reltuples::int8 end,
-           obj_description(c.oid, 'pg_class')
-    from pg_class c
-    join pg_namespace n on n.oid = c.relnamespace
-    where c.relkind in ('r', 'p', 'v', 'm', 'f')";
+/// The catalog of the server a connection reached, where it differs from PostgreSQL's in ways
+/// one query cannot take. CockroachDB's differences are taken by the queries themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Catalog {
+    PostgreSql,
+    /// RisingWave (SpelaionDB's SDB-302): `pg_class` has no `reltuples`, `pg_proc` lists no
+    /// user function and has no `pg_get_function_identity_arguments`, oids are `int4`, and a
+    /// relation's definition is kept as written in `rw_catalog.rw_relations`.
+    RisingWave,
+}
+
+impl Catalog {
+    /// From `select version()`: RisingWave names itself after PostgreSQL's version.
+    pub fn from_version(version: &str) -> Self {
+        if version.contains("RisingWave") {
+            Catalog::RisingWave
+        } else {
+            Catalog::PostgreSql
+        }
+    }
+}
+
+/// The relation `$1.$2`, by name: no oid is ever read back and sent again, since a server of
+/// PostgreSQL's protocol may answer one in another type (RisingWave's are `int4`).
+pub(crate) const RELATION: &str = "(select c.oid from pg_class c \
+     join pg_namespace n on n.oid = c.relnamespace where n.nspname = $1 and c.relname = $2)";
+
+/// An empty comment is no comment: PostgreSQL never keeps one (`COMMENT … IS ''` removes it),
+/// and RisingWave answers `''` for every object.
+fn objects_sql(catalog: Catalog) -> String {
+    let estimate = match catalog {
+        Catalog::PostgreSql => "case when c.reltuples < 0 then null else c.reltuples::int8 end",
+        Catalog::RisingWave => "null::int8",
+    };
+    format!(
+        "select n.nspname::text, c.relname::text, c.relkind::text, {estimate},
+                nullif(obj_description(c.oid, 'pg_class'), '')
+         from pg_class c
+         join pg_namespace n on n.oid = c.relnamespace
+         where c.relkind in ('r', 'p', 'v', 'm', 'f')"
+    )
+}
 
 fn object_from_row(r: &Row) -> Result<ObjectInfo> {
     let kind: String = r.get(2);
@@ -86,6 +121,7 @@ fn object_from_row(r: &Row) -> Result<ObjectInfo> {
 
 pub async fn list_objects(
     client: &Client,
+    catalog: Catalog,
     schema: &str,
     like: &LikeFilter,
 ) -> Result<Vec<ObjectInfo>> {
@@ -94,7 +130,8 @@ pub async fn list_objects(
     // Partitions are skipped: they will appear under their parent table. `is not true`, not
     // `not`: CockroachDB leaves `relispartition` NULL, and `not NULL` would skip every table.
     let sql = format!(
-        "{OBJECTS_SQL} and n.nspname = $1 and c.relispartition is not true{narrow} order by c.relname"
+        "{} and n.nspname = $1 and c.relispartition is not true{narrow} order by c.relname",
+        objects_sql(catalog)
     );
     let rows = client
         .query(&sql, &query_params(&[schema], &patterns))
@@ -128,34 +165,36 @@ pub async fn list_columns(client: &Client, schema: &str) -> Result<Vec<SchemaCol
         .collect())
 }
 
-pub async fn describe_table(client: &Client, schema: &str, name: &str) -> Result<TableInfo> {
-    let sql = format!("{OBJECTS_SQL} and n.nspname = $1 and c.relname = $2");
+pub async fn describe_table(
+    client: &Client,
+    catalog: Catalog,
+    schema: &str,
+    name: &str,
+) -> Result<TableInfo> {
+    let sql = format!(
+        "{} and n.nspname = $1 and c.relname = $2",
+        objects_sql(catalog)
+    );
     let row = client
         .query_opt(&sql, &[&schema, &name])
         .await
         .map_err(map_error)?
         .ok_or_else(|| DriverError::Other(format!("{schema}.{name} does not exist")))?;
     let object = object_from_row(&row)?;
-
-    let oid: u32 = client
-        .query_one(
-            "select c.oid from pg_class c join pg_namespace n on n.oid = c.relnamespace
-             where n.nspname = $1 and c.relname = $2",
-            &[&schema, &name],
-        )
-        .await
-        .map_err(map_error)?
-        .get(0);
+    let relation = [&schema as &(dyn ToSql + Sync), &name];
 
     let columns = client
         .query(
-            "select a.attname::text, format_type(a.atttypid, a.atttypmod), not a.attnotnull,
-                    pg_get_expr(d.adbin, d.adrelid), col_description(a.attrelid, a.attnum)
-             from pg_attribute a
-             left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
-             where a.attrelid = $1 and a.attnum > 0 and not a.attisdropped
-             order by a.attnum",
-            &[&oid],
+            &format!(
+                "select a.attname::text, format_type(a.atttypid, a.atttypmod), not a.attnotnull,
+                        pg_get_expr(d.adbin, d.adrelid),
+                        nullif(col_description(a.attrelid, a.attnum), '')
+                 from pg_attribute a
+                 left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+                 where a.attrelid = {RELATION} and a.attnum > 0 and not a.attisdropped
+                 order by a.attnum"
+            ),
+            &relation,
         )
         .await
         .map_err(map_error)?
@@ -169,29 +208,36 @@ pub async fn describe_table(client: &Client, schema: &str, name: &str) -> Result
         })
         .collect();
 
+    // From the primary key's constraint, whose columns are in key order: RisingWave has no
+    // `LATERAL`, and lists the table itself in `pg_index` as its primary key's index.
     let primary_key = client
-        .query(
-            "select a.attname::text
-             from pg_index i
-             cross join lateral unnest(i.indkey) with ordinality as k(attnum, ord)
-             join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
-             where i.indrelid = $1 and i.indisprimary
-             order by k.ord",
-            &[&oid],
+        .query_opt(
+            &format!(
+                "select array(select a.attname::text
+                              from unnest(con.conkey) with ordinality as k(attnum, ord)
+                              join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.attnum
+                              order by k.ord)
+                 from pg_constraint con
+                 where con.conrelid = {RELATION} and con.contype = 'p'"
+            ),
+            &relation,
         )
         .await
         .map_err(map_error)?
-        .iter()
         .map(|r| r.get(0))
-        .collect();
+        .unwrap_or_default();
 
+    // `indexrelid <> indrelid`: RisingWave's row for a table's own primary key is the table,
+    // which `pg_get_indexdef` refuses.
     let indexes = client
         .query(
-            "select ic.relname::text, i.indisunique, i.indisprimary, pg_get_indexdef(i.indexrelid)
-             from pg_index i join pg_class ic on ic.oid = i.indexrelid
-             where i.indrelid = $1
-             order by ic.relname",
-            &[&oid],
+            &format!(
+                "select ic.relname::text, i.indisunique, i.indisprimary, pg_get_indexdef(i.indexrelid)
+                 from pg_index i join pg_class ic on ic.oid = i.indexrelid
+                 where i.indrelid = {RELATION} and i.indexrelid <> i.indrelid
+                 order by ic.relname"
+            ),
+            &relation,
         )
         .await
         .map_err(map_error)?
@@ -206,7 +252,8 @@ pub async fn describe_table(client: &Client, schema: &str, name: &str) -> Result
 
     let foreign_keys = client
         .query(
-            "select con.conname::text,
+            &format!(
+                "select con.conname::text,
                     array(select a.attname::text from unnest(con.conkey) with ordinality k(n, o)
                           join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.n order by k.o),
                     rn.nspname::text, rc.relname::text,
@@ -215,9 +262,10 @@ pub async fn describe_table(client: &Client, schema: &str, name: &str) -> Result
              from pg_constraint con
              join pg_class rc on rc.oid = con.confrelid
              join pg_namespace rn on rn.oid = rc.relnamespace
-             where con.conrelid = $1 and con.contype = 'f'
-             order by con.conname",
-            &[&oid],
+             where con.conrelid = {RELATION} and con.contype = 'f'
+             order by con.conname"
+            ),
+            &relation,
         )
         .await
         .map_err(map_error)?
@@ -231,17 +279,29 @@ pub async fn describe_table(client: &Client, schema: &str, name: &str) -> Result
         })
         .collect();
 
+    // RisingWave writes no definition (`pg_get_constraintdef` is NULL there): a key's is
+    // written from its columns, as PostgreSQL would write it.
     let constraints = client
         .query(
-            "select c.conname::text, c.contype::text, pg_get_constraintdef(c.oid, true),
-                    array(select a.attname::text
-                          from unnest(c.conkey) with ordinality as k(attnum, ord)
-                          join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
-                          order by k.ord)
-             from pg_constraint c
-             where c.conrelid = $1 and c.contype in ('p', 'u', 'c')
-             order by c.contype <> 'p', c.conname",
-            &[&oid],
+            &format!(
+                "select c.conname::text, c.contype::text,
+                        coalesce(pg_get_constraintdef(c.oid, true),
+                                 case c.contype when 'p' then 'PRIMARY KEY' when 'u' then 'UNIQUE' end
+                                 || ' (' || array_to_string(array(
+                                     select quote_ident(a.attname)
+                                     from unnest(c.conkey) with ordinality as k(attnum, ord)
+                                     join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+                                     order by k.ord), ', ') || ')',
+                                 ''),
+                        array(select a.attname::text
+                              from unnest(c.conkey) with ordinality as k(attnum, ord)
+                              join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+                              order by k.ord)
+                 from pg_constraint c
+                 where c.conrelid = {RELATION} and c.contype in ('p', 'u', 'c')
+                 order by c.contype <> 'p', c.conname"
+            ),
+            &relation,
         )
         .await
         .map_err(map_error)?

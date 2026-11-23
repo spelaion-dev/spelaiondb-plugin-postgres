@@ -8,7 +8,7 @@ use spelaion_driver_api::{
 };
 use tokio_postgres::Client;
 
-use crate::introspect::{like_sql, query_params};
+use crate::introspect::{Catalog, like_sql, query_params};
 use crate::map_error;
 
 /// `pg_depend` rows that make an object part of something else: of an extension (`e`), or
@@ -22,19 +22,30 @@ fn not_owned(catalog: &str, oid: &str) -> String {
 
 pub async fn list_schema_objects(
     client: &Client,
+    catalog: Catalog,
     schema: &str,
     like: &LikeFilter,
 ) -> Result<Vec<SchemaObject>> {
     let mut patterns = Vec::new();
     let narrow = like_sql(like, "o.name", &mut patterns, 1);
+    // RisingWave's `pg_proc` lists no user function and has no
+    // `pg_get_function_identity_arguments`: its routines are left out, and the rest (empty
+    // there today) is read as on PostgreSQL.
+    let routines = match catalog {
+        Catalog::PostgreSql => format!(
+            "select p.proname::text, \
+                    case p.prokind when 'p' then 'procedure' when 'a' then 'aggregate' \
+                         else 'function' end, \
+                    pg_get_function_identity_arguments(p.oid), obj_description(p.oid, 'pg_proc') \
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace \
+             where n.nspname = $1 and {} \
+             union all ",
+            not_owned("pg_proc", "p.oid")
+        ),
+        Catalog::RisingWave => String::new(),
+    };
     let sql = format!(
-        "select * from (select p.proname::text, \
-                case p.prokind when 'p' then 'procedure' when 'a' then 'aggregate' \
-                     else 'function' end, \
-                pg_get_function_identity_arguments(p.oid), obj_description(p.oid, 'pg_proc') \
-         from pg_proc p join pg_namespace n on n.oid = p.pronamespace \
-         where n.nspname = $1 and {proc} \
-         union all \
+        "select * from ({routines}\
          select c.relname::text, 'sequence', null, obj_description(c.oid, 'pg_class') \
          from pg_class c join pg_namespace n on n.oid = c.relnamespace \
          where n.nspname = $1 and c.relkind = 'S' and {class} \
@@ -55,7 +66,6 @@ pub async fn list_schema_objects(
                 or (select c.relkind from pg_class c where c.oid = t.typrelid) = 'c') \
          ) as o(name, kind, detail, comment) where true{narrow} \
          order by 1, 2, 3",
-        proc = not_owned("pg_proc", "p.oid"),
         class = not_owned("pg_class", "c.oid"),
         table = not_owned("pg_class", "c.oid"),
         type_ = not_owned("pg_type", "t.oid"),

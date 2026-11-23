@@ -6,9 +6,63 @@
 use spelaion_driver_api::{DriverError, Result, terminated};
 use tokio_postgres::Client;
 
+use crate::introspect::{Catalog, RELATION};
 use crate::map_error;
 
-pub async fn relation_definition(client: &Client, schema: &str, name: &str) -> Result<String> {
+pub async fn relation_definition(
+    client: &Client,
+    catalog: Catalog,
+    schema: &str,
+    name: &str,
+) -> Result<String> {
+    match catalog {
+        Catalog::PostgreSql => postgres_definition(client, schema, name).await,
+        Catalog::RisingWave => risingwave_definition(client, schema, name).await,
+    }
+}
+
+/// RisingWave keeps each relation's statement as it was written (`rw_catalog.rw_relations`),
+/// with what its catalog does not show (sources, connectors, watermarks): that statement, then
+/// the table's indexes. RisingWave keeps no comment where `obj_description` reads it.
+async fn risingwave_definition(client: &Client, schema: &str, name: &str) -> Result<String> {
+    let definition: Option<String> = client
+        .query_opt(
+            "select r.definition from rw_catalog.rw_relations r
+             join pg_namespace n on n.oid = r.schema_id
+             where n.nspname = $1 and r.name = $2
+               and r.relation_type in ('table', 'view', 'materialized view')",
+            &[&schema, &name],
+        )
+        .await
+        .map_err(map_error)?
+        .map(|row| row.try_get(0))
+        .transpose()
+        .map_err(|e| DriverError::Other(format!("reading {schema}.{name}'s definition: {e}")))?;
+    let definition =
+        definition.ok_or_else(|| DriverError::Other(format!("{schema}.{name} does not exist")))?;
+    let mut statements = vec![terminated(&definition)];
+    let indexes = client
+        .query(
+            &format!(
+                "select r.definition from rw_catalog.rw_relations r
+                 join pg_index i on i.indexrelid = r.id
+                 where i.indrelid = {RELATION} and i.indexrelid <> i.indrelid
+                 order by r.name"
+            ),
+            &[&schema, &name],
+        )
+        .await
+        .map_err(map_error)?;
+    for row in indexes {
+        let index: String = row
+            .try_get(0)
+            .map_err(|e| DriverError::Other(format!("reading an index's definition: {e}")))?;
+        statements.push(terminated(&index));
+    }
+    Ok(statements.join("\n\n"))
+}
+
+async fn postgres_definition(client: &Client, schema: &str, name: &str) -> Result<String> {
     let row = client
         .query_opt(
             "select c.oid, c.relkind::text, format('%I.%I', n.nspname, c.relname),
@@ -20,7 +74,10 @@ pub async fn relation_definition(client: &Client, schema: &str, name: &str) -> R
         .await
         .map_err(map_error)?
         .ok_or_else(|| DriverError::Other(format!("{schema}.{name} does not exist")))?;
-    let oid: u32 = row.get(0);
+    // An oid in another type is an error, never a panic of the plugin.
+    let oid: u32 = row
+        .try_get(0)
+        .map_err(|e| DriverError::Other(format!("reading {schema}.{name}'s oid: {e}")))?;
     let kind: String = row.get(1);
     let qualified: String = row.get(2);
     let comment: Option<String> = row.get(3);

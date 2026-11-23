@@ -123,6 +123,7 @@ impl Driver for PostgresDriver {
                 insert_rows: true,
                 bound_params: true,
             },
+            catalog: tokio::sync::OnceCell::new(),
         }))
     }
 }
@@ -138,6 +139,8 @@ struct PgConnection {
     cancel: Arc<PgCancel>,
     notices: Arc<Mutex<Vec<Notice>>>,
     capabilities: Capabilities,
+    /// Read from the server the first time the explorer needs it, never at connect.
+    catalog: tokio::sync::OnceCell<introspect::Catalog>,
 }
 
 /// Accepts any type and hands over the raw binary bytes.
@@ -210,6 +213,26 @@ impl PgConnection {
 
     async fn lock_sql(&self) -> Result<tokio::sync::OwnedMutexGuard<()>> {
         self.cancel.order.lock(&self.client).await
+    }
+
+    /// Which catalog the explorer's queries read, from `version()`. Called with the SQL lock
+    /// held, as every catalog query is.
+    async fn catalog(&self) -> Result<introspect::Catalog> {
+        self.catalog
+            .get_or_try_init(|| async {
+                let version: String = self
+                    .client
+                    .query_one("select version()", &[])
+                    .await
+                    .map_err(map_error)?
+                    .try_get(0)
+                    .map_err(|e| {
+                        DriverError::Other(format!("reading the server's version: {e}"))
+                    })?;
+                Ok(introspect::Catalog::from_version(&version))
+            })
+            .await
+            .copied()
     }
 
     /// Streams the rows of a prepared statement, with `params` bound to it.
@@ -376,7 +399,13 @@ impl Connection for PgConnection {
 
     async fn list_objects(&self, schema: &str) -> Result<Vec<ObjectInfo>> {
         let _permit = self.lock_sql().await?;
-        introspect::list_objects(&self.client, schema, &LikeFilter::default()).await
+        introspect::list_objects(
+            &self.client,
+            self.catalog().await?,
+            schema,
+            &LikeFilter::default(),
+        )
+        .await
     }
 
     // Narrowed in the catalog query, then matched exactly (ADR-025).
@@ -393,8 +422,13 @@ impl Connection for PgConnection {
         filter: &NameFilter,
     ) -> Result<Vec<ObjectInfo>> {
         let _permit = self.lock_sql().await?;
-        let mut objects =
-            introspect::list_objects(&self.client, schema, &filter.server_side()).await?;
+        let mut objects = introspect::list_objects(
+            &self.client,
+            self.catalog().await?,
+            schema,
+            &filter.server_side(),
+        )
+        .await?;
         objects.retain(|o| filter.matches(&o.name));
         Ok(objects)
     }
@@ -405,15 +439,20 @@ impl Connection for PgConnection {
         filter: &NameFilter,
     ) -> Result<Vec<SchemaObject>> {
         let _permit = self.lock_sql().await?;
-        let mut objects =
-            objects::list_schema_objects(&self.client, schema, &filter.server_side()).await?;
+        let mut objects = objects::list_schema_objects(
+            &self.client,
+            self.catalog().await?,
+            schema,
+            &filter.server_side(),
+        )
+        .await?;
         objects.retain(|o| filter.matches(&o.name));
         Ok(objects)
     }
 
     async fn describe_table(&self, schema: &str, name: &str) -> Result<TableInfo> {
         let _permit = self.lock_sql().await?;
-        introspect::describe_table(&self.client, schema, name).await
+        introspect::describe_table(&self.client, self.catalog().await?, schema, name).await
     }
 
     async fn list_columns(&self, schema: &str) -> Result<Vec<SchemaColumn>> {
@@ -428,7 +467,13 @@ impl Connection for PgConnection {
 
     async fn list_schema_objects(&self, schema: &str) -> Result<Vec<SchemaObject>> {
         let _permit = self.lock_sql().await?;
-        objects::list_schema_objects(&self.client, schema, &LikeFilter::default()).await
+        objects::list_schema_objects(
+            &self.client,
+            self.catalog().await?,
+            schema,
+            &LikeFilter::default(),
+        )
+        .await
     }
 
     async fn list_server_objects(&self) -> Result<Vec<ServerObject>> {
@@ -443,7 +488,7 @@ impl Connection for PgConnection {
 
     async fn relation_definition(&self, schema: &str, name: &str) -> Result<String> {
         let _permit = self.lock_sql().await?;
-        ddl::relation_definition(&self.client, schema, name).await
+        ddl::relation_definition(&self.client, self.catalog().await?, schema, name).await
     }
 
     async fn procedure_call(&self, object: &SchemaObject) -> Result<String> {
