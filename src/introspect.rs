@@ -67,13 +67,20 @@ pub enum Catalog {
     /// user function and has no `pg_get_function_identity_arguments`, oids are `int4`, and a
     /// relation's definition is kept as written in `rw_catalog.rw_relations`.
     RisingWave,
+    /// Materialize (SpelaionDB's SDB-303): no `format`, no
+    /// `pg_get_function_identity_arguments` and no user functions; sources are listed in
+    /// `pg_class` as tables; a relation's definition is what `SHOW CREATE` writes.
+    Materialize,
 }
 
 impl Catalog {
-    /// From `select version()`: RisingWave names itself after PostgreSQL's version.
+    /// From `select version()`: both name themselves after PostgreSQL's version
+    /// (`PostgreSQL 9.5 on … (Materialize 26.50.1)`).
     pub fn from_version(version: &str) -> Self {
         if version.contains("RisingWave") {
             Catalog::RisingWave
+        } else if version.contains("(Materialize ") {
+            Catalog::Materialize
         } else {
             Catalog::PostgreSql
         }
@@ -89,7 +96,10 @@ pub(crate) const RELATION: &str = "(select c.oid from pg_class c \
 /// and RisingWave answers `''` for every object.
 fn objects_sql(catalog: Catalog) -> String {
     let estimate = match catalog {
-        Catalog::PostgreSql => "case when c.reltuples < 0 then null else c.reltuples::int8 end",
+        // Materialize keeps `reltuples` at -1: no estimate either.
+        Catalog::PostgreSql | Catalog::Materialize => {
+            "case when c.reltuples < 0 then null else c.reltuples::int8 end"
+        }
         Catalog::RisingWave => "null::int8",
     };
     format!(

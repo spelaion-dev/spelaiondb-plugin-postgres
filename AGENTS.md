@@ -23,9 +23,10 @@ says only what is different in this repository.
   driver sets nothing for the session. `tests/pgbouncer.rs` runs it through PgBouncer.
 - Servers that speak PostgreSQL's protocol are reached through this driver too, and the
   explorer's queries must take their catalogs: CockroachDB's differences are taken by the
-  queries themselves (`tests/cockroachdb.rs`, in CI); RisingWave's need other queries
-  (`introspect::Catalog`, read from `version()` the first time the explorer asks;
-  `tests/risingwave.rs`, with `SPELAION_TEST_RISINGWAVE`, not in CI: its image is about 11 GB).
+  queries themselves (`tests/cockroachdb.rs`, in CI); RisingWave's and Materialize's need
+  other queries (`introspect::Catalog`, read from `version()` the first time the explorer
+  asks; `tests/risingwave.rs` with `SPELAION_TEST_RISINGWAVE` and `tests/materialize.rs` with
+  `SPELAION_TEST_MATERIALIZE`, not in CI: their images are large).
   No query reads an oid back to send it again: they find a relation by its schema and name.
 - `tests/postgres.rs`: the type zoo against a real server (`tests/snapshots`). **A new type
   is added there first.** `tests/conformance.rs`: SpelaionDB's conformance set against this

@@ -28,8 +28,8 @@ pub async fn list_schema_objects(
 ) -> Result<Vec<SchemaObject>> {
     let mut patterns = Vec::new();
     let narrow = like_sql(like, "o.name", &mut patterns, 1);
-    // RisingWave's `pg_proc` lists no user function and has no
-    // `pg_get_function_identity_arguments`: its routines are left out, and the rest (empty
+    // RisingWave's and Materialize's `pg_proc` list no user function, and neither has
+    // `pg_get_function_identity_arguments`: their routines are left out, and the rest (empty
     // there today) is read as on PostgreSQL.
     let routines = match catalog {
         Catalog::PostgreSql => format!(
@@ -42,7 +42,7 @@ pub async fn list_schema_objects(
              union all ",
             not_owned("pg_proc", "p.oid")
         ),
-        Catalog::RisingWave => String::new(),
+        Catalog::RisingWave | Catalog::Materialize => String::new(),
     };
     let sql = format!(
         "select * from ({routines}\
