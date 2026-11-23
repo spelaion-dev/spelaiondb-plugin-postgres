@@ -71,13 +71,19 @@ pub enum Catalog {
     /// `pg_get_function_identity_arguments` and no user functions; sources are listed in
     /// `pg_class` as tables; a relation's definition is what `SHOW CREATE` writes.
     Materialize,
+    /// CrateDB (SpelaionDB's SDB-304): oids are `regclass`; no `unnest … with ordinality`, no
+    /// foreign keys, no `pg_get_indexdef`, `pg_trigger` or `pg_extension`; user functions are
+    /// in `information_schema.routines`; a table's definition is `SHOW CREATE TABLE`'s.
+    CrateDb,
 }
 
 impl Catalog {
-    /// From `select version()`: both name themselves after PostgreSQL's version
-    /// (`PostgreSQL 9.5 on … (Materialize 26.50.1)`).
+    /// From `select version()`: RisingWave and Materialize name themselves after PostgreSQL's
+    /// version (`PostgreSQL 9.5 on … (Materialize 26.50.1)`); CrateDB's starts with its name.
     pub fn from_version(version: &str) -> Self {
-        if version.contains("RisingWave") {
+        if version.starts_with("CrateDB") {
+            Catalog::CrateDb
+        } else if version.contains("RisingWave") {
             Catalog::RisingWave
         } else if version.contains("(Materialize ") {
             Catalog::Materialize
@@ -96,8 +102,8 @@ pub(crate) const RELATION: &str = "(select c.oid from pg_class c \
 /// and RisingWave answers `''` for every object.
 fn objects_sql(catalog: Catalog) -> String {
     let estimate = match catalog {
-        // Materialize keeps `reltuples` at -1: no estimate either.
-        Catalog::PostgreSql | Catalog::Materialize => {
+        // Materialize and CrateDB keep `reltuples` at -1 for tables: no estimate either.
+        Catalog::PostgreSql | Catalog::Materialize | Catalog::CrateDb => {
             "case when c.reltuples < 0 then null else c.reltuples::int8 end"
         }
         Catalog::RisingWave => "null::int8",
@@ -217,6 +223,22 @@ pub async fn describe_table(
             comment: r.get(4),
         })
         .collect();
+
+    match catalog {
+        // No foreign keys, no index to define, and no `unnest … with ordinality`.
+        Catalog::CrateDb => {
+            let (primary_key, constraints) = crate_keys(client, schema, name).await?;
+            return Ok(TableInfo {
+                object,
+                columns,
+                primary_key,
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+                constraints,
+            });
+        }
+        Catalog::PostgreSql | Catalog::RisingWave | Catalog::Materialize => {}
+    }
 
     // From the primary key's constraint, whose columns are in key order: RisingWave has no
     // `LATERAL`, and lists the table itself in `pg_index` as its primary key's index.
@@ -346,13 +368,88 @@ pub async fn describe_table(
     })
 }
 
-/// The foreign keys pointing to `schema.name`. Those of partitions are left out: they are
-/// copies of their parent table's key, which is listed.
-pub async fn list_referencing_keys(
+/// CrateDB's primary key and constraints: each constraint from `pg_constraint`, with the
+/// definition CrateDB writes, and the columns of a key from `information_schema`, in order
+/// (CrateDB has no `unnest … with ordinality`).
+async fn crate_keys(
     client: &Client,
     schema: &str,
     name: &str,
+) -> Result<(Vec<String>, Vec<ConstraintInfo>)> {
+    let read = |e: tokio_postgres::Error| {
+        DriverError::Other(format!("reading {schema}.{name}'s constraints: {e}"))
+    };
+    let mut columns: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for row in client
+        .query(
+            "select constraint_name, column_name from information_schema.key_column_usage
+             where table_schema = $1 and table_name = $2
+             order by constraint_name, ordinal_position",
+            &[&schema, &name],
+        )
+        .await
+        .map_err(map_error)?
+    {
+        let (constraint, column): (String, String) =
+            (row.try_get(0).map_err(read)?, row.try_get(1).map_err(read)?);
+        columns.entry(constraint).or_default().push(column);
+    }
+    let mut primary_key = Vec::new();
+    let mut constraints = Vec::new();
+    for row in client
+        .query(
+            &format!(
+                "select conname::text, contype::text, pg_get_constraintdef(oid, true)
+                 from pg_constraint
+                 where conrelid = {RELATION} and contype in ('p', 'u', 'c')
+                 order by conname"
+            ),
+            &[&schema, &name],
+        )
+        .await
+        .map_err(map_error)?
+    {
+        let conname: String = row.try_get(0).map_err(read)?;
+        let contype: String = row.try_get(1).map_err(read)?;
+        let definition: Option<String> = row.try_get(2).map_err(read)?;
+        let kind = match contype.as_str() {
+            "p" => ConstraintKind::PrimaryKey,
+            "u" => ConstraintKind::Unique,
+            _ => ConstraintKind::Check,
+        };
+        let key = match kind {
+            ConstraintKind::Check => Vec::new(),
+            ConstraintKind::PrimaryKey | ConstraintKind::Unique => {
+                columns.get(&conname).cloned().unwrap_or_default()
+            }
+        };
+        if kind == ConstraintKind::PrimaryKey {
+            primary_key = key.clone();
+        }
+        constraints.push(ConstraintInfo {
+            name: Some(conname),
+            kind,
+            columns: key,
+            definition: definition.unwrap_or_default(),
+        });
+    }
+    // The primary key first, as on PostgreSQL.
+    constraints.sort_by_key(|c| c.kind != ConstraintKind::PrimaryKey);
+    Ok((primary_key, constraints))
+}
+
+/// The foreign keys pointing to `schema.name`. Those of partitions are left out: they are
+/// copies of their parent table's key, which is listed. CrateDB has no foreign keys.
+pub async fn list_referencing_keys(
+    client: &Client,
+    catalog: Catalog,
+    schema: &str,
+    name: &str,
 ) -> Result<Vec<ReferencingKey>> {
+    match catalog {
+        Catalog::CrateDb => return Ok(Vec::new()),
+        Catalog::PostgreSql | Catalog::RisingWave | Catalog::Materialize => {}
+    }
     let rows = client
         .query(
             "select n.nspname::text, c.relname::text, con.conname::text,

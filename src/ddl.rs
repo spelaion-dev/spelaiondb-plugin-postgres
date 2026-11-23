@@ -19,7 +19,50 @@ pub async fn relation_definition(
         Catalog::PostgreSql => postgres_definition(client, schema, name).await,
         Catalog::RisingWave => risingwave_definition(client, schema, name).await,
         Catalog::Materialize => materialize_definition(client, schema, name).await,
+        Catalog::CrateDb => crate_definition(client, schema, name).await,
     }
+}
+
+/// CrateDB writes a table's statement itself (`SHOW CREATE TABLE`, with its sharding and
+/// settings); a view's query is in `information_schema.views`. `SHOW` takes no parameters, so
+/// the name in it is quoted by the server.
+async fn crate_definition(client: &Client, schema: &str, name: &str) -> Result<String> {
+    let read = |what: &str, e: tokio_postgres::Error| {
+        DriverError::Other(format!("reading {schema}.{name}'s {what}: {e}"))
+    };
+    let row = client
+        .query_opt(
+            "select c.relkind::text, quote_ident(n.nspname) || '.' || quote_ident(c.relname)
+             from pg_class c join pg_namespace n on n.oid = c.relnamespace
+             where n.nspname = $1 and c.relname = $2 and c.relkind in ('r', 'v')",
+            &[&schema, &name],
+        )
+        .await
+        .map_err(map_error)?
+        .ok_or_else(|| DriverError::Other(format!("{schema}.{name} does not exist")))?;
+    let kind: String = row.try_get(0).map_err(|e| read("kind", e))?;
+    let qualified: String = row.try_get(1).map_err(|e| read("name", e))?;
+    if kind == "v" {
+        let query: String = client
+            .query_one(
+                "select view_definition from information_schema.views
+                 where table_schema = $1 and table_name = $2",
+                &[&schema, &name],
+            )
+            .await
+            .map_err(map_error)?
+            .try_get(0)
+            .map_err(|e| read("query", e))?;
+        let query = query.trim().trim_end_matches(';');
+        return Ok(format!("CREATE OR REPLACE VIEW {qualified} AS\n{query};"));
+    }
+    let sql: String = client
+        .query_one(&format!("SHOW CREATE TABLE {qualified}"), &[])
+        .await
+        .map_err(map_error)?
+        .try_get(0)
+        .map_err(|e| read("definition", e))?;
+    Ok(terminated(&sql))
 }
 
 /// Materialize writes each object's statement itself (`SHOW CREATE`), sources included, which

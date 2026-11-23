@@ -26,6 +26,10 @@ pub async fn list_schema_objects(
     schema: &str,
     like: &LikeFilter,
 ) -> Result<Vec<SchemaObject>> {
+    match catalog {
+        Catalog::CrateDb => return crate_functions(client, schema, like).await,
+        Catalog::PostgreSql | Catalog::RisingWave | Catalog::Materialize => {}
+    }
     let mut patterns = Vec::new();
     let narrow = like_sql(like, "o.name", &mut patterns, 1);
     // RisingWave's and Materialize's `pg_proc` list no user function, and neither has
@@ -42,7 +46,7 @@ pub async fn list_schema_objects(
              union all ",
             not_owned("pg_proc", "p.oid")
         ),
-        Catalog::RisingWave | Catalog::Materialize => String::new(),
+        Catalog::RisingWave | Catalog::Materialize | Catalog::CrateDb => String::new(),
     };
     let sql = format!(
         "select * from ({routines}\
@@ -118,9 +122,21 @@ const SERVER_OBJECTS_SQL: &str = "select rolname::text, 'role', \
 /// SQLSTATE `undefined_function`.
 const UNDEFINED_FUNCTION: &str = "42883";
 
-pub async fn list_server_objects(client: &Client) -> Result<Vec<ServerObject>> {
-    let with_location =
-        SERVER_OBJECTS_SQL.replace("{location}", "nullif(pg_tablespace_location(oid), '')");
+/// CrateDB's roles: it has no tablespaces of its own and no `pg_extension`.
+const CRATE_SERVER_OBJECTS_SQL: &str = "select rolname::text, 'role', \
+            nullif(concat_ws(', ', case when rolsuper then 'SUPERUSER' end, \
+                             case when rolcanlogin then 'LOGIN' end), ''), \
+            rolname ~ '^pg_' \
+     from pg_roles \
+     order by 1";
+
+pub async fn list_server_objects(client: &Client, catalog: Catalog) -> Result<Vec<ServerObject>> {
+    let with_location = match catalog {
+        Catalog::CrateDb => CRATE_SERVER_OBJECTS_SQL.to_string(),
+        Catalog::PostgreSql | Catalog::RisingWave | Catalog::Materialize => {
+            SERVER_OBJECTS_SQL.replace("{location}", "nullif(pg_tablespace_location(oid), '')")
+        }
+    };
     let rows = match client.query(&with_location, &[]).await {
         Ok(rows) => rows,
         // Servers that speak PostgreSQL's protocol without its tablespaces on disk
@@ -279,7 +295,108 @@ pub async fn procedure_call(client: &Client, object: &SchemaObject) -> Result<St
     }
 }
 
-pub async fn object_definition(client: &Client, object: &SchemaObject) -> Result<String> {
+/// CrateDB's user functions, from `information_schema.routines`: the detail is the argument
+/// types, as its `specific_name` (`add(integer, integer)`) writes them.
+async fn crate_functions(
+    client: &Client,
+    schema: &str,
+    like: &LikeFilter,
+) -> Result<Vec<SchemaObject>> {
+    let mut patterns = Vec::new();
+    let narrow = like_sql(like, "routine_name", &mut patterns, 1);
+    let rows = client
+        .query(
+            &format!(
+                "select routine_name, specific_name from information_schema.routines
+                 where routine_schema = $1 and routine_type = 'FUNCTION'{narrow}
+                 order by 1, 2"
+            ),
+            &query_params(&[schema], &patterns),
+        )
+        .await
+        .map_err(map_error)?;
+    rows.iter()
+        .map(|r| {
+            let read = |e: tokio_postgres::Error| {
+                DriverError::Other(format!("reading CrateDB's functions: {e}"))
+            };
+            let name: String = r.try_get(0).map_err(read)?;
+            let specific: String = r.try_get(1).map_err(read)?;
+            Ok(SchemaObject {
+                schema: schema.to_string(),
+                detail: Some(crate_arguments(&name, &specific).to_string()),
+                name,
+                kind: SchemaObjectKind::Function,
+                comment: None,
+            })
+        })
+        .collect()
+}
+
+/// The argument types inside CrateDB's `specific_name`: `add(integer, integer)` → `integer,
+/// integer`.
+fn crate_arguments<'a>(name: &str, specific: &'a str) -> &'a str {
+    specific
+        .strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix('('))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or("")
+}
+
+/// A CrateDB function's `CREATE OR REPLACE FUNCTION`, from what `information_schema.routines`
+/// keeps (its names quoted by the server, its body as a literal written here).
+async fn crate_function_definition(client: &Client, object: &SchemaObject) -> Result<String> {
+    let detail = object.detail.clone().unwrap_or_default();
+    let missing =
+        || DriverError::Other(format!("{}.{} does not exist", object.schema, object.name));
+    let rows = client
+        .query(
+            "select quote_ident(routine_schema) || '.' || quote_ident(routine_name), data_type,
+                    routine_body, routine_definition, specific_name
+             from information_schema.routines
+             where routine_schema = $1 and routine_name = $2 and routine_type = 'FUNCTION'",
+            &[&object.schema, &object.name],
+        )
+        .await
+        .map_err(map_error)?;
+    let read = |e: tokio_postgres::Error| {
+        DriverError::Other(format!("reading {}'s definition: {e}", object.name))
+    };
+    for row in rows {
+        let specific: String = row.try_get(4).map_err(read)?;
+        if crate_arguments(&object.name, &specific) != detail {
+            continue;
+        }
+        let qualified: String = row.try_get(0).map_err(read)?;
+        let returns: String = row.try_get(1).map_err(read)?;
+        let language: String = row.try_get(2).map_err(read)?;
+        let body: Option<String> = row.try_get(3).map_err(read)?;
+        let body = body.unwrap_or_default().replace('\'', "''");
+        return Ok(format!(
+            "CREATE OR REPLACE FUNCTION {qualified}({detail})\nRETURNS {returns}\nLANGUAGE {}\nAS '{body}';",
+            language.to_ascii_uppercase()
+        ));
+    }
+    Err(missing())
+}
+
+pub async fn object_definition(
+    client: &Client,
+    catalog: Catalog,
+    object: &SchemaObject,
+) -> Result<String> {
+    match (catalog, object.kind) {
+        (Catalog::CrateDb, SchemaObjectKind::Function) => {
+            return crate_function_definition(client, object).await;
+        }
+        (Catalog::CrateDb, _) => {
+            return Err(DriverError::Other(format!(
+                "CrateDB has no {:?} objects",
+                object.kind
+            )));
+        }
+        (Catalog::PostgreSql | Catalog::RisingWave | Catalog::Materialize, _) => {}
+    }
     let detail = object.detail.clone().unwrap_or_default();
     let (sql, with_detail) = match object.kind {
         SchemaObjectKind::Function | SchemaObjectKind::Procedure => {

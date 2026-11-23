@@ -462,7 +462,7 @@ impl Connection for PgConnection {
 
     async fn list_referencing_keys(&self, schema: &str, name: &str) -> Result<Vec<ReferencingKey>> {
         let _permit = self.lock_sql().await?;
-        introspect::list_referencing_keys(&self.client, schema, name).await
+        introspect::list_referencing_keys(&self.client, self.catalog().await?, schema, name).await
     }
 
     async fn list_schema_objects(&self, schema: &str) -> Result<Vec<SchemaObject>> {
@@ -478,12 +478,12 @@ impl Connection for PgConnection {
 
     async fn list_server_objects(&self) -> Result<Vec<ServerObject>> {
         let _permit = self.lock_sql().await?;
-        objects::list_server_objects(&self.client).await
+        objects::list_server_objects(&self.client, self.catalog().await?).await
     }
 
     async fn object_definition(&self, object: &SchemaObject) -> Result<String> {
         let _permit = self.lock_sql().await?;
-        objects::object_definition(&self.client, object).await
+        objects::object_definition(&self.client, self.catalog().await?, object).await
     }
 
     async fn relation_definition(&self, schema: &str, name: &str) -> Result<String> {
