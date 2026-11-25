@@ -78,7 +78,8 @@ pub async fn list_schema_objects(
         .query(&sql, &query_params(&[schema], &patterns))
         .await
         .map_err(map_error)?;
-    rows.iter()
+    let mut objects = rows
+        .iter()
         .map(|r| {
             let kind: String = r.get(1);
             Ok(SchemaObject {
@@ -97,6 +98,61 @@ pub async fn list_schema_objects(
                 },
                 detail: r.get(2),
                 comment: r.get(3),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    match catalog {
+        Catalog::Materialize => {
+            objects.extend(materialize_schema_objects(client, schema, like).await?);
+            objects.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        Catalog::PostgreSql | Catalog::RisingWave | Catalog::CrateDb => {}
+    }
+    Ok(objects)
+}
+
+/// Materialize's sinks, connections and secrets in `schema` of the current database
+/// (SpelaionDB's ADR-082), with a sink's or connection's type as their detail. A secret is
+/// listed by name only: its value is never read.
+async fn materialize_schema_objects(
+    client: &Client,
+    schema: &str,
+    like: &LikeFilter,
+) -> Result<Vec<SchemaObject>> {
+    let mut patterns = Vec::new();
+    let narrow = like_sql(like, "o.name", &mut patterns, 1);
+    let sql = format!(
+        "select o.name, o.kind, o.detail from ( \
+             select k.name, 'sink' as kind, k.type as detail, k.schema_id \
+             from mz_catalog.mz_sinks k \
+             union all \
+             select c.name, 'connection', c.type, c.schema_id from mz_catalog.mz_connections c \
+             union all \
+             select s.name, 'secret', null, s.schema_id from mz_catalog.mz_secrets s \
+         ) as o \
+         join mz_catalog.mz_schemas sc on sc.id = o.schema_id \
+         join mz_catalog.mz_databases d on d.id = sc.database_id \
+         where d.name = current_database() and sc.name = $1{narrow} \
+         order by 1, 2"
+    );
+    let rows = client
+        .query(&sql, &query_params(&[schema], &patterns))
+        .await
+        .map_err(map_error)?;
+    rows.iter()
+        .map(|r| {
+            let kind: String = r.get(1);
+            Ok(SchemaObject {
+                schema: schema.to_string(),
+                name: r.get(0),
+                kind: match kind.as_str() {
+                    "sink" => SchemaObjectKind::Sink,
+                    "connection" => SchemaObjectKind::Connection,
+                    "secret" => SchemaObjectKind::Secret,
+                    other => return Err(DriverError::Other(format!("unexpected kind {other}"))),
+                },
+                detail: r.get(2),
+                comment: None,
             })
         })
         .collect()
@@ -148,22 +204,125 @@ pub async fn list_server_objects(client: &Client, catalog: Catalog) -> Result<Ve
             .map_err(map_error)?,
         Err(e) => return Err(map_error(e)),
     };
-    rows.iter()
-        .map(|r| {
-            let kind: String = r.get(1);
-            Ok(ServerObject {
-                name: r.get(0),
-                kind: match kind.as_str() {
-                    "role" => ServerObjectKind::Role,
-                    "tablespace" => ServerObjectKind::Tablespace,
-                    "extension" => ServerObjectKind::Extension,
-                    other => return Err(DriverError::Other(format!("unexpected kind {other}"))),
-                },
-                detail: r.get(2),
-                system: r.get(3),
+    let mut objects = rows.iter().map(server_object).collect::<Result<Vec<_>>>()?;
+    match catalog {
+        Catalog::Materialize => {
+            let rows = client
+                .query(MATERIALIZE_CLUSTERS_SQL, &[])
+                .await
+                .map_err(map_error)?;
+            for row in &rows {
+                objects.push(server_object(row)?);
+            }
+        }
+        Catalog::PostgreSql | Catalog::RisingWave | Catalog::CrateDb => {}
+    }
+    Ok(objects)
+}
+
+/// Materialize's clusters and their replicas (SpelaionDB's ADR-082). A replica's name is
+/// `cluster.replica`, unique among them; the built-in ones (ids starting with `s`) are system.
+const MATERIALIZE_CLUSTERS_SQL: &str = "select c.name, 'cluster', \
+            case when c.managed \
+                 then c.size || ' · replication factor ' || c.replication_factor::text \
+                 else 'unmanaged' end, \
+            c.id like 's%' \
+     from mz_catalog.mz_clusters c \
+     union all \
+     select c.name || '.' || r.name, 'cluster_replica', \
+            'cluster ' || c.name || coalesce(' · ' || r.size, ''), c.id like 's%' \
+     from mz_catalog.mz_cluster_replicas r join mz_catalog.mz_clusters c on c.id = r.cluster_id \
+     order by 2, 1";
+
+fn server_object(r: &tokio_postgres::Row) -> Result<ServerObject> {
+    let kind: String = r.get(1);
+    Ok(ServerObject {
+        name: r.get(0),
+        kind: match kind.as_str() {
+            "role" => ServerObjectKind::Role,
+            "tablespace" => ServerObjectKind::Tablespace,
+            "extension" => ServerObjectKind::Extension,
+            "cluster" => ServerObjectKind::Cluster,
+            "cluster_replica" => ServerObjectKind::ClusterReplica,
+            other => return Err(DriverError::Other(format!("unexpected kind {other}"))),
+        },
+        detail: r.get(2),
+        system: r.get(3),
+    })
+}
+
+/// The definition of a Materialize cluster (`SHOW CREATE CLUSTER`) or of one of its replicas,
+/// which Materialize does not write: `CREATE CLUSTER REPLICA` from its size and zone, said to
+/// come from the cluster when the cluster is managed (ADR-082). Other servers have none.
+pub async fn server_object_definition(
+    client: &Client,
+    catalog: Catalog,
+    object: &ServerObject,
+) -> Result<String> {
+    let none =
+        || DriverError::Other("this engine has no definitions for objects outside a schema".into());
+    match catalog {
+        Catalog::Materialize => {}
+        Catalog::PostgreSql | Catalog::RisingWave | Catalog::CrateDb => return Err(none()),
+    }
+    let missing = || DriverError::Other(format!("{} does not exist", object.name));
+    match object.kind {
+        ServerObjectKind::Cluster => {
+            let row = client
+                .query_opt(
+                    "select quote_ident(name) from mz_catalog.mz_clusters where name = $1",
+                    &[&object.name],
+                )
+                .await
+                .map_err(map_error)?
+                .ok_or_else(missing)?;
+            let quoted: String = row.get(0);
+            crate::ddl::show_create(client, "CLUSTER", &quoted).await
+        }
+        ServerObjectKind::ClusterReplica => {
+            let row = client
+                .query_opt(
+                    "select quote_ident(c.name), quote_ident(r.name), r.size, \
+                            r.availability_zone, c.managed \
+                     from mz_catalog.mz_cluster_replicas r \
+                     join mz_catalog.mz_clusters c on c.id = r.cluster_id \
+                     where c.name || '.' || r.name = $1",
+                    &[&object.name],
+                )
+                .await
+                .map_err(map_error)?
+                .ok_or_else(missing)?;
+            let (cluster, replica): (String, String) = (row.get(0), row.get(1));
+            let size: Option<String> = row.get(2);
+            let zone: Option<String> = row.get(3);
+            let managed: bool = row.get(4);
+            let literal = |text: &str| format!("'{}'", text.replace('\'', "''"));
+            let options: Vec<String> = [
+                size.map(|s| format!("SIZE = {}", literal(&s))),
+                zone.map(|z| format!("AVAILABILITY ZONE = {}", literal(&z))),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let statement = format!(
+                "CREATE CLUSTER REPLICA {cluster}.{replica} ({});",
+                options.join(", ")
+            );
+            Ok(if managed {
+                format!(
+                    "-- A replica of the managed cluster {cluster}: Materialize creates it from \
+                     the cluster's SIZE and REPLICATION FACTOR.\n{statement}"
+                )
+            } else {
+                statement
             })
-        })
-        .collect()
+        }
+        ServerObjectKind::Role
+        | ServerObjectKind::User
+        | ServerObjectKind::Login
+        | ServerObjectKind::Tablespace
+        | ServerObjectKind::Extension => Err(none()),
+    }
 }
 
 /// A function, procedure or aggregate by its schema, name and identity arguments.
@@ -395,7 +554,38 @@ pub async fn object_definition(
                 object.kind
             )));
         }
-        (Catalog::PostgreSql | Catalog::RisingWave | Catalog::Materialize, _) => {}
+        (Catalog::Materialize, SchemaObjectKind::Sink | SchemaObjectKind::Connection) => {
+            return materialize_object_definition(client, object).await;
+        }
+        (Catalog::Materialize, SchemaObjectKind::Secret) => {
+            return Err(DriverError::Other(format!(
+                "{}.{} is a secret: Materialize never shows a secret's value, and SpelaionDB \
+                 never reads it, so it has no definition here",
+                object.schema, object.name
+            )));
+        }
+        (
+            Catalog::PostgreSql | Catalog::RisingWave | Catalog::Materialize,
+            SchemaObjectKind::Function
+            | SchemaObjectKind::Procedure
+            | SchemaObjectKind::Aggregate
+            | SchemaObjectKind::Sequence
+            | SchemaObjectKind::Trigger
+            | SchemaObjectKind::Enum
+            | SchemaObjectKind::Domain
+            | SchemaObjectKind::Type
+            | SchemaObjectKind::Event
+            | SchemaObjectKind::Synonym,
+        ) => {}
+        (
+            Catalog::PostgreSql | Catalog::RisingWave,
+            SchemaObjectKind::Sink | SchemaObjectKind::Connection | SchemaObjectKind::Secret,
+        ) => {
+            return Err(DriverError::Other(format!(
+                "this server has no {:?} objects",
+                object.kind
+            )));
+        }
     }
     let detail = object.detail.clone().unwrap_or_default();
     let (sql, with_detail) = match object.kind {
@@ -408,7 +598,11 @@ pub async fn object_definition(
         SchemaObjectKind::Enum | SchemaObjectKind::Domain | SchemaObjectKind::Type => {
             (TYPE_SQL.to_string(), false)
         }
-        SchemaObjectKind::Event | SchemaObjectKind::Synonym => {
+        SchemaObjectKind::Event
+        | SchemaObjectKind::Synonym
+        | SchemaObjectKind::Sink
+        | SchemaObjectKind::Connection
+        | SchemaObjectKind::Secret => {
             return Err(DriverError::Other(format!(
                 "PostgreSQL has no {:?} objects",
                 object.kind
@@ -429,4 +623,36 @@ pub async fn object_definition(
     definition.map(|d| terminated(&d)).ok_or_else(|| {
         DriverError::Other(format!("{}.{} does not exist", object.schema, object.name))
     })
+}
+
+/// A Materialize sink's or connection's statement, as the server writes it (`SHOW CREATE`).
+/// `SHOW` takes no parameters, so the name in it is quoted by the server (`quote_ident`).
+async fn materialize_object_definition(client: &Client, object: &SchemaObject) -> Result<String> {
+    let (table, statement) = match object.kind {
+        SchemaObjectKind::Sink => ("mz_sinks", "SINK"),
+        SchemaObjectKind::Connection => ("mz_connections", "CONNECTION"),
+        other => {
+            return Err(DriverError::Other(format!(
+                "Materialize writes no definition of {other:?} objects here"
+            )));
+        }
+    };
+    let row = client
+        .query_opt(
+            &format!(
+                "select quote_ident(sc.name) || '.' || quote_ident(o.name) \
+                 from mz_catalog.{table} o \
+                 join mz_catalog.mz_schemas sc on sc.id = o.schema_id \
+                 join mz_catalog.mz_databases d on d.id = sc.database_id \
+                 where d.name = current_database() and sc.name = $1 and o.name = $2"
+            ),
+            &[&object.schema, &object.name],
+        )
+        .await
+        .map_err(map_error)?
+        .ok_or_else(|| {
+            DriverError::Other(format!("{}.{} does not exist", object.schema, object.name))
+        })?;
+    let qualified: String = row.get(0);
+    crate::ddl::show_create(client, statement, &qualified).await
 }
