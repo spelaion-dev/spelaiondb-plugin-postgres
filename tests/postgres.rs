@@ -571,6 +571,88 @@ async fn introspection_describes_tables() {
     }
 }
 
+/// Every table of a schema in five catalog queries (SpelaionDB's SDB-220) is each table exactly
+/// as `describe_table` describes it: composite, self-referencing and cross-schema keys, unique
+/// and check constraints, indexes, defaults, comments, a partitioned table (its partitions left
+/// out, as `list_objects` leaves them), an empty table and names that need quoting; views and
+/// materialized views are not tables.
+#[tokio::test]
+async fn describe_tables_is_describe_table_for_every_table() {
+    let Some(conn) = connect().await else { return };
+    let schema = format!("spelaion_batched_{}", std::process::id());
+    let other = format!("{schema}_other");
+    let ddl = format!(
+        r#"create schema "{schema}";
+         create schema "{other}";
+         create table "{other}".country (code char(2) primary key);
+         create table "{schema}".customer (
+             id int primary key, email text not null unique, country char(2) references "{other}".country,
+             referrer int references "{schema}".customer (id), age int check (age >= 0) default 18
+         );
+         comment on table "{schema}".customer is 'customers';
+         comment on column "{schema}".customer.email is 'where we write';
+         create table "{schema}"."Order Lines" (
+             order_id bigint, n int, customer_id int not null references "{schema}".customer,
+             "Total ""net""" numeric(12, 2) default 0, primary key (order_id, n),
+             unique (customer_id, n), constraint total_positive check ("Total ""net""" >= 0)
+         );
+         create index lines_total on "{schema}"."Order Lines" ("Total ""net""" desc);
+         create table "{schema}".events (at date not null, kind text) partition by range (at);
+         create table "{schema}".events_2026 partition of "{schema}".events
+             for values from ('2026-01-01') to ('2027-01-01');
+         create view "{schema}".v as select * from "{schema}".customer;
+         create materialized view "{schema}".mv as select id from "{schema}".customer;
+         create table "{schema}".lonely ()"#
+    );
+    for stmt in ddl.split(';') {
+        run(&*conn, stmt)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e:?}"));
+    }
+
+    let result = async {
+        let batched = conn
+            .describe_tables(&schema)
+            .await
+            .unwrap()
+            .expect("PostgreSQL reads every table at once");
+        let names: Vec<_> = batched.iter().map(|t| t.object.name.as_str()).collect();
+        assert_eq!(names, ["Order Lines", "customer", "events", "lonely"]);
+        assert_eq!(batched[2].object.kind, ObjectKind::PartitionedTable);
+        for table in &batched {
+            let one = conn
+                .describe_table(&schema, &table.object.name)
+                .await
+                .unwrap();
+            assert_eq!(*table, one, "{}", table.object.name);
+        }
+        let customer = &batched[1];
+        assert_eq!(customer.object.comment.as_deref(), Some("customers"));
+        assert_eq!(customer.foreign_keys.len(), 2);
+        assert_eq!(batched[0].primary_key, ["order_id", "n"]);
+        // Only the schema's own tables; a schema that is not there has none, which is not
+        // "no batched read".
+        assert_eq!(
+            conn.describe_tables(&other).await.unwrap().map(|t| t.len()),
+            Some(1)
+        );
+        assert_eq!(
+            conn.describe_tables("no_such_schema_here").await.unwrap(),
+            Some(vec![])
+        );
+    };
+    let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(result)).await;
+    run(&*conn, &format!(r#"drop schema "{schema}" cascade"#))
+        .await
+        .unwrap();
+    run(&*conn, &format!(r#"drop schema "{other}" cascade"#))
+        .await
+        .unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[tokio::test]
 async fn explorer_lists_the_other_objects_of_a_schema() {
     let Some(conn) = connect().await else { return };
