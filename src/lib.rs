@@ -394,6 +394,22 @@ impl Connection for PgConnection {
         Ok(row.get(0))
     }
 
+    /// The server's databases this user may open (SpelaionDB's ADR-074). A session never
+    /// changes database: `select_database` stays unsupported, and another database is another
+    /// session. Only PostgreSQL's own catalog (CockroachDB's answers the same query); the
+    /// other servers of its protocol are not checked yet and say so.
+    async fn list_databases(&self) -> Result<Vec<String>> {
+        let _permit = self.lock_sql().await?;
+        match self.catalog().await? {
+            introspect::Catalog::PostgreSql => introspect::list_databases(&self.client).await,
+            introspect::Catalog::RisingWave
+            | introspect::Catalog::Materialize
+            | introspect::Catalog::CrateDb => Err(DriverError::Other(
+                "listing databases is not supported on this server".into(),
+            )),
+        }
+    }
+
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>> {
         let _permit = self.lock_sql().await?;
         introspect::list_schemas(&self.client, &LikeFilter::default()).await

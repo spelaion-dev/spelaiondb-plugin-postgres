@@ -30,6 +30,10 @@ says only what is different in this repository.
   CI: their images are large). Whether a server keeps transactions is SpelaionDB's core's to
   decide from the server it reached: the driver still says `transactions: true`.
   No query reads an oid back to send it again: they find a relation by its schema and name.
+  `list_databases` answers the databases the user may open (accepting connections, not a
+  template, with `CONNECT`; SpelaionDB's ADR-074), on PostgreSQL's catalog only;
+  `select_database` stays unsupported: another database is another session
+  (`tests/databases.rs`).
   Materialize's sinks, connections and secrets (schema objects) and clusters and replicas
   (server objects) are protocol 1.3's kinds (SpelaionDB's ADR-082), read from `mz_catalog`; a
   secret's value is never read and it has no definition. The sink part of

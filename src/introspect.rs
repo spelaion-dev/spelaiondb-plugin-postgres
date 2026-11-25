@@ -35,6 +35,23 @@ pub(crate) fn query_params<'a>(
         .collect()
 }
 
+/// The server's databases a session of this user could open (SpelaionDB's ADR-074): those that
+/// accept connections, never a template, and only where the user has `CONNECT` (a superuser
+/// has it everywhere), ordered by name. A read of the catalog: no name is written into SQL.
+pub async fn list_databases(client: &Client) -> Result<Vec<String>> {
+    let rows = client
+        .query(
+            "select datname::text from pg_catalog.pg_database
+             where datallowconn and not datistemplate
+               and pg_catalog.has_database_privilege(oid, 'CONNECT')
+             order by datname",
+            &[],
+        )
+        .await
+        .map_err(map_error)?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
+}
+
 pub async fn list_schemas(client: &Client, like: &LikeFilter) -> Result<Vec<SchemaInfo>> {
     let mut patterns = Vec::new();
     let narrow = like_sql(like, "nspname::text", &mut patterns, 0);
