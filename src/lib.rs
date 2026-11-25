@@ -20,7 +20,7 @@ use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use spelaion_driver_api::{
-    CancelHandle, Capabilities, ColumnMeta, ColumnOrigin, ConnectParams, Connection, Dialect,
+    CancelHandle, Capabilities, Cell, ColumnMeta, ColumnOrigin, ConnectParams, Connection, Dialect,
     Driver, DriverError, EventStream, ExecEvent, ExecOptions, InsertTarget, KeepAlive, LikeFilter,
     NameFilter, Notice, ObjectInfo, ReferencingKey, Result, ResultSchema, SchemaColumn, SchemaInfo,
     SchemaObject, ServerObject, TableInfo, TextRows, TransactionState,
@@ -122,6 +122,8 @@ impl Driver for PostgresDriver {
                 schemas: true,
                 insert_rows: true,
                 bound_params: true,
+                // A `bytea` column takes bytes as COPY's hex form (SDB-464).
+                insert_bytes: true,
             },
             catalog: tokio::sync::OnceCell::new(),
         }))
@@ -518,7 +520,7 @@ impl Connection for PgConnection {
         let mut sink = std::pin::pin!(sink);
         let mut chunk = String::with_capacity(COPY_CHUNK + 4096);
         for row in 0..rows.len() {
-            copy_text_row(&mut chunk, rows.row(row));
+            copy_text_row(&mut chunk, rows.cells(row));
             if chunk.len() >= COPY_CHUNK {
                 let data = bytes::Bytes::from(std::mem::take(&mut chunk));
                 sink.send(data).await.map_err(map_error)?;
@@ -568,14 +570,22 @@ pub fn copy_sql(target: &InsertTarget, dialect: &dyn Dialect) -> String {
 
 /// One row of COPY's text format: values separated by tabs, `\N` for NULL, and backslashes,
 /// tabs, newlines and carriage returns escaped, so a value can never end its field or its row.
-fn copy_text_row<'a>(out: &mut String, row: impl IntoIterator<Item = Option<&'a str>>) {
+/// Bytes go as `bytea`'s hex form, `\x` and two digits a byte, its backslash escaped (SDB-464).
+fn copy_text_row<'a>(out: &mut String, row: impl IntoIterator<Item = Option<Cell<'a>>>) {
+    use std::fmt::Write as _;
     for (i, value) in row.into_iter().enumerate() {
         if i > 0 {
             out.push('\t');
         }
         match value {
             None => out.push_str(r"\N"),
-            Some(text) => {
+            Some(Cell::Bytes(bytes)) => {
+                out.push_str(r"\\x");
+                for byte in bytes {
+                    let _ = write!(out, "{byte:02x}");
+                }
+            }
+            Some(Cell::Text(text)) => {
                 for c in text.chars() {
                     match c {
                         '\\' => out.push_str(r"\\"),
@@ -594,15 +604,36 @@ fn copy_text_row<'a>(out: &mut String, row: impl IntoIterator<Item = Option<&'a 
 #[cfg(test)]
 mod copy_tests {
     use super::copy_text_row;
+    use spelaion_driver_api::Cell;
 
     #[test]
     fn copy_rows_escape_everything_that_could_end_a_field() {
         let mut out = String::new();
         copy_text_row(
             &mut out,
-            [Some("a\tb\nc\\d\re"), None, Some(r"\N"), Some("")],
+            [
+                Some(Cell::Text("a\tb\nc\\d\re")),
+                None,
+                Some(Cell::Text(r"\N")),
+                Some(Cell::Text("")),
+            ],
         );
         assert_eq!(out, "a\\tb\\nc\\\\d\\re\t\\N\t\\\\N\t\n");
+    }
+
+    /// Bytes as `bytea`'s hex form, which holds no tab, line end or lone backslash (SDB-464).
+    #[test]
+    fn copy_rows_carry_bytes_as_hex() {
+        let mut out = String::new();
+        copy_text_row(
+            &mut out,
+            [
+                Some(Cell::Bytes(&[0x00, 0x09, 0x0a, 0x5c, 0xff])),
+                Some(Cell::Bytes(&[])),
+                None,
+            ],
+        );
+        assert_eq!(out, "\\\\x00090a5cff\t\\\\x\t\\N\n");
     }
 }
 
