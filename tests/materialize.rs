@@ -9,8 +9,8 @@
 
 use futures_util::TryStreamExt;
 use spelaion_driver_api::{
-    ConnectParams, Connection, Driver, DriverError, ExecEvent, ExecOptions, ObjectKind,
-    ServerObjectKind,
+    ConnectParams, Connection, Driver, DriverError, ExecEvent, ExecOptions, NameFilter, ObjectKind,
+    SchemaObjectKind, ServerObjectKind,
 };
 use spelaion_driver_postgres::PostgresDriver;
 
@@ -150,5 +150,144 @@ async fn the_explorer_reads_materializes_catalog() {
     ] {
         let _ = run(conn, &sql).await;
     }
+    result.unwrap();
+}
+
+/// Sinks, connections and secrets in a schema, and clusters with their replicas outside every
+/// schema (SpelaionDB's ADR-082), with their definitions. A secret is listed by name and has no
+/// definition: its value is never read. The sink needs a Kafka broker that Materialize can
+/// reach, `SPELAION_TEST_MATERIALIZE_KAFKA=host:port` as Materialize sees it (SpelaionDB's
+/// `testing/docker/pg-family` starts Redpanda); without it the sink is skipped with a notice.
+#[tokio::test]
+async fn sinks_connections_secrets_and_clusters_show_with_their_definitions() {
+    let Some(conn) = connect().await else {
+        return;
+    };
+    let conn = conn.as_ref();
+    let id = std::process::id();
+    let schema = format!("spelaion_objects_{id}");
+    let kafka = std::env::var("SPELAION_TEST_MATERIALIZE_KAFKA").ok();
+    if kafka.is_none() {
+        eprintln!("SPELAION_TEST_MATERIALIZE_KAFKA not set: the sink is skipped");
+    }
+    let mut setup = vec![
+        format!("create schema {schema}"),
+        format!("create table {schema}.items (id int)"),
+        format!("create secret {schema}.pw as 'never-read-{id}'"),
+        format!(
+            "create connection {schema}.upstream to postgres (host 'localhost', port 5432, \
+             user 'x', password secret {schema}.pw, database 'x') with (validate = false)"
+        ),
+    ];
+    if let Some(broker) = &kafka {
+        setup.push(format!(
+            "create connection {schema}.broker to kafka (broker '{broker}', \
+             security protocol = 'PLAINTEXT')"
+        ));
+        setup.push(format!(
+            "create sink {schema}.items_out from {schema}.items \
+             into kafka connection {schema}.broker (topic 'items_{id}') \
+             format json envelope debezium"
+        ));
+    }
+    for sql in &setup {
+        run(conn, sql).await.unwrap();
+    }
+    let checks = async {
+        let objects = conn.list_schema_objects(&schema).await?;
+        let found = |name: &str| objects.iter().find(|o| o.name == name);
+        let upstream = found("upstream").expect("the connection is listed");
+        assert_eq!(upstream.kind, SchemaObjectKind::Connection);
+        assert_eq!(upstream.detail.as_deref(), Some("postgres"));
+        let pw = found("pw").expect("the secret is listed");
+        assert_eq!(pw.kind, SchemaObjectKind::Secret);
+        assert_eq!(pw.detail, None);
+
+        let ddl = conn.object_definition(upstream).await?;
+        assert!(
+            ddl.starts_with("CREATE CONNECTION")
+                && ddl.contains(&format!("materialize.{schema}.upstream")),
+            "{ddl}"
+        );
+        // The secret is named, never its value.
+        assert!(!ddl.contains("never-read"), "{ddl}");
+        let refused = conn.object_definition(pw).await.unwrap_err().to_string();
+        assert!(refused.contains("never reads it"), "{refused}");
+        assert!(!refused.contains("never-read"), "{refused}");
+
+        if kafka.is_some() {
+            let sink = found("items_out").expect("the sink is listed");
+            assert_eq!(sink.kind, SchemaObjectKind::Sink);
+            assert_eq!(sink.detail.as_deref(), Some("kafka"));
+            let ddl = conn.object_definition(sink).await?;
+            assert!(
+                ddl.starts_with("CREATE SINK")
+                    && ddl.contains(&format!("materialize.{schema}.items_out")),
+                "{ddl}"
+            );
+            assert_eq!(
+                found("broker").map(|o| o.kind),
+                Some(SchemaObjectKind::Connection)
+            );
+        }
+        // A filter narrows them like the other schema objects.
+        let narrowed = conn
+            .list_schema_objects_matching(
+                &schema,
+                &NameFilter {
+                    include: vec!["up*".into()],
+                    exclude: Vec::new(),
+                },
+            )
+            .await?;
+        assert_eq!(
+            narrowed.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
+            ["upstream"]
+        );
+
+        let server = conn.list_server_objects().await?;
+        let cluster = server
+            .iter()
+            .find(|o| o.kind == ServerObjectKind::Cluster && o.name == "quickstart")
+            .expect("the default cluster is listed");
+        assert!(!cluster.system);
+        assert!(
+            cluster
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("replication factor")),
+            "{cluster:?}"
+        );
+        assert!(
+            server
+                .iter()
+                .any(|o| o.kind == ServerObjectKind::Cluster && o.system),
+            "the built-in clusters are system ones"
+        );
+        let replica = server
+            .iter()
+            .find(|o| o.kind == ServerObjectKind::ClusterReplica && o.name == "quickstart.r1")
+            .expect("the default cluster's replica is listed");
+        let ddl = conn.server_object_definition(cluster).await?;
+        assert!(ddl.starts_with("CREATE CLUSTER \"quickstart\""), "{ddl}");
+        assert!(ddl.ends_with(';'), "{ddl}");
+        let ddl = conn.server_object_definition(replica).await?;
+        assert!(
+            ddl.contains("CREATE CLUSTER REPLICA quickstart.r1 (SIZE = '"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.starts_with("-- A replica of the managed cluster"),
+            "{ddl}"
+        );
+        let role = server
+            .iter()
+            .find(|o| o.kind == ServerObjectKind::Role)
+            .expect("a role");
+        assert!(conn.server_object_definition(role).await.is_err());
+        Ok::<_, DriverError>(())
+    };
+    let result = checks.await;
+    let _ = run(conn, &format!("drop schema if exists {schema} cascade")).await;
     result.unwrap();
 }

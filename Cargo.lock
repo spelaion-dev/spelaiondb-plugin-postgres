@@ -510,7 +510,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1135,7 +1135,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1349,8 +1349,8 @@ dependencies = [
 
 [[package]]
 name = "spelaion-dialect"
-version = "0.10.0"
-source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.3.1#82e6dae4c859a6ec20b663140c0116fa196f65af"
+version = "0.15.0"
+source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.4.0#55c0502b984bba8b1b5e21e4ef71e9461652528d"
 dependencies = [
  "serde_json",
  "spelaion-driver-api",
@@ -1358,49 +1358,51 @@ dependencies = [
 
 [[package]]
 name = "spelaion-driver-api"
-version = "0.10.0"
-source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.3.1#82e6dae4c859a6ec20b663140c0116fa196f65af"
+version = "0.15.0"
+source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.4.0#55c0502b984bba8b1b5e21e4ef71e9461652528d"
 dependencies = [
  "arrow",
  "async-trait",
  "futures-util",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.21",
  "tokio",
 ]
 
 [[package]]
 name = "spelaion-plugin-host"
-version = "0.10.0"
-source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.3.1#82e6dae4c859a6ec20b663140c0116fa196f65af"
+version = "0.15.0"
+source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.4.0#55c0502b984bba8b1b5e21e4ef71e9461652528d"
 dependencies = [
  "arrow",
  "async-trait",
  "futures-util",
+ "rustix",
  "serde",
  "serde_json",
  "spelaion-driver-api",
  "spelaion-plugin-protocol",
  "tokio",
+ "win32job",
 ]
 
 [[package]]
 name = "spelaion-plugin-protocol"
-version = "0.10.0"
-source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.3.1#82e6dae4c859a6ec20b663140c0116fa196f65af"
+version = "0.15.0"
+source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.4.0#55c0502b984bba8b1b5e21e4ef71e9461652528d"
 dependencies = [
  "arrow",
  "serde",
  "serde_json",
  "spelaion-driver-api",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "spelaion-plugin-sdk"
-version = "0.10.0"
-source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.3.1#82e6dae4c859a6ec20b663140c0116fa196f65af"
+version = "0.15.0"
+source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.4.0#55c0502b984bba8b1b5e21e4ef71e9461652528d"
 dependencies = [
  "arrow",
  "futures-util",
@@ -1493,7 +1495,16 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
 ]
 
 [[package]]
@@ -1502,7 +1513,18 @@ version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.21",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1787,6 +1809,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "win32job"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21b25acac91041257d64f5625690b626133e0ca9e4e17814552b5803b1a82f7c"
+dependencies = [
+ "thiserror 1.0.69",
+ "windows",
+]
+
+[[package]]
+name = "windows"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
+dependencies = [
+ "windows-collections",
+ "windows-core",
+ "windows-future",
+ "windows-numerics",
+]
+
+[[package]]
+name = "windows-collections"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
+dependencies = [
+ "windows-core",
+]
+
+[[package]]
 name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1797,6 +1850,17 @@ dependencies = [
  "windows-link",
  "windows-result",
  "windows-strings",
+]
+
+[[package]]
+name = "windows-future"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
+dependencies = [
+ "windows-core",
+ "windows-link",
+ "windows-threading",
 ]
 
 [[package]]
@@ -1826,6 +1890,16 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-numerics"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
+dependencies = [
+ "windows-core",
+ "windows-link",
+]
 
 [[package]]
 name = "windows-result"
@@ -1877,6 +1951,15 @@ dependencies = [
  "windows_x86_64_gnu",
  "windows_x86_64_gnullvm",
  "windows_x86_64_msvc",
+]
+
+[[package]]
+name = "windows-threading"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
+dependencies = [
+ "windows-link",
 ]
 
 [[package]]

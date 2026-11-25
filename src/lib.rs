@@ -486,6 +486,11 @@ impl Connection for PgConnection {
         objects::object_definition(&self.client, self.catalog().await?, object).await
     }
 
+    async fn server_object_definition(&self, object: &ServerObject) -> Result<String> {
+        let _permit = self.lock_sql().await?;
+        objects::server_object_definition(&self.client, self.catalog().await?, object).await
+    }
+
     async fn relation_definition(&self, schema: &str, name: &str) -> Result<String> {
         let _permit = self.lock_sql().await?;
         ddl::relation_definition(&self.client, self.catalog().await?, schema, name).await

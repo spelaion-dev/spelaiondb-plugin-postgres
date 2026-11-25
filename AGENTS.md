@@ -30,6 +30,10 @@ says only what is different in this repository.
   CI: their images are large). Whether a server keeps transactions is SpelaionDB's core's to
   decide from the server it reached: the driver still says `transactions: true`.
   No query reads an oid back to send it again: they find a relation by its schema and name.
+  Materialize's sinks, connections and secrets (schema objects) and clusters and replicas
+  (server objects) are protocol 1.3's kinds (SpelaionDB's ADR-082), read from `mz_catalog`; a
+  secret's value is never read and it has no definition. The sink part of
+  `tests/materialize.rs` needs `SPELAION_TEST_MATERIALIZE_KAFKA` (a broker Materialize reaches).
 - `tests/postgres.rs`: the type zoo against a real server (`tests/snapshots`). **A new type
   is added there first.** `tests/conformance.rs`: SpelaionDB's conformance set against this
   program, and `plugin.toml` checked against what the program says of itself.

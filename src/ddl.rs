@@ -121,7 +121,7 @@ async fn materialize_definition(client: &Client, schema: &str, name: &str) -> Re
 }
 
 /// `SHOW CREATE <what> <qualified>`'s statement: its second column.
-async fn show_create(client: &Client, what: &str, qualified: &str) -> Result<String> {
+pub(crate) async fn show_create(client: &Client, what: &str, qualified: &str) -> Result<String> {
     let row = client
         .query_one(&format!("SHOW CREATE {what} {qualified}"), &[])
         .await
