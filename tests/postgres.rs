@@ -1431,3 +1431,42 @@ async fn copy_from_stdin_and_to_stdout_are_refused_and_the_session_survives() {
         "copy t from stdin"
     );
 }
+
+/// A column of bytes loads every byte as it is, the empty bytes and NULL apart (SDB-464).
+#[tokio::test]
+async fn insert_rows_loads_bytes_as_they_are() {
+    use spelaion_driver_api::{Cell, ColumnKind, InsertTarget, TextRows};
+    let Some(conn) = connect().await else { return };
+    assert!(conn.capabilities().insert_bytes);
+    let table = format!("bytes_{}", std::process::id());
+    run(&*conn, &format!("drop table if exists {table}"))
+        .await
+        .unwrap();
+    run(
+        &*conn,
+        &format!("create table {table} (id int, data bytea)"),
+    )
+    .await
+    .unwrap();
+    let every: Vec<u8> = (0..=255).collect();
+    let mut rows = TextRows::builder_with(&[ColumnKind::Text, ColumnKind::Bytes]);
+    rows.push_cells([Some(Cell::Text("1")), Some(Cell::Bytes(&every))])
+        .unwrap();
+    rows.push_cells([Some(Cell::Text("2")), Some(Cell::Bytes(&[]))])
+        .unwrap();
+    rows.push_cells([Some(Cell::Text("3")), None]).unwrap();
+    let target = InsertTarget {
+        schema: "public".into(),
+        table: table.clone(),
+        columns: vec!["id".into(), "data".into()],
+    };
+    assert_eq!(conn.insert_rows(&target, rows.finish()).await.unwrap(), 3);
+    let hex: String = every.iter().map(|b| format!("{b:02x}")).collect();
+    for (id, expected) in [(1, hex.as_str()), (2, ""), (3, "NULL")] {
+        let sql = format!(
+            "select coalesce(encode(data, 'hex'), 'NULL') as h from {table} where id = {id}"
+        );
+        assert_eq!(first_row(&*conn, &sql).await[0].3, expected, "row {id}");
+    }
+    run(&*conn, &format!("drop table {table}")).await.unwrap();
+}
