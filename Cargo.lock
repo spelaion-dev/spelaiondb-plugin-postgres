@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "spelaiondb-plugin-postgres"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "arrow",
  "async-stream",
