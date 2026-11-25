@@ -4,6 +4,8 @@ use spelaion_driver_api::{
     ColumnInfo, ConstraintInfo, ConstraintKind, DriverError, ForeignKeyInfo, IndexInfo, LikeFilter,
     ObjectInfo, ObjectKind, ReferencingKey, Result, SchemaColumn, SchemaInfo, TableInfo,
 };
+use std::collections::HashMap;
+
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Row};
 
@@ -232,13 +234,7 @@ pub async fn describe_table(
         .await
         .map_err(map_error)?
         .iter()
-        .map(|r| ColumnInfo {
-            name: r.get(0),
-            native_type: r.get(1),
-            nullable: r.get(2),
-            default: r.get(3),
-            comment: r.get(4),
-        })
+        .map(|r| column_from(r, 0))
         .collect();
 
     match catalog {
@@ -291,12 +287,7 @@ pub async fn describe_table(
         .await
         .map_err(map_error)?
         .iter()
-        .map(|r| IndexInfo {
-            name: r.get(0),
-            unique: r.get(1),
-            primary: r.get(2),
-            definition: r.get(3),
-        })
+        .map(|r| index_from(r, 0))
         .collect();
 
     let foreign_keys = client
@@ -319,13 +310,7 @@ pub async fn describe_table(
         .await
         .map_err(map_error)?
         .iter()
-        .map(|r| ForeignKeyInfo {
-            name: r.get(0),
-            columns: r.get(1),
-            referenced_schema: r.get(2),
-            referenced_table: r.get(3),
-            referenced_columns: r.get(4),
-        })
+        .map(|r| foreign_key_from(r, 0))
         .collect();
 
     // RisingWave writes no definition (`pg_get_constraintdef` is NULL there): a key's is
@@ -355,24 +340,7 @@ pub async fn describe_table(
         .await
         .map_err(map_error)?
         .iter()
-        .map(|r| {
-            let kind: String = r.get(1);
-            let kind = match kind.as_str() {
-                "p" => ConstraintKind::PrimaryKey,
-                "u" => ConstraintKind::Unique,
-                _ => ConstraintKind::Check,
-            };
-            ConstraintInfo {
-                name: Some(r.get(0)),
-                kind,
-                columns: if kind == ConstraintKind::Check {
-                    Vec::new()
-                } else {
-                    r.get(3)
-                },
-                definition: r.get(2),
-            }
-        })
+        .map(|r| constraint_from(r, 0))
         .collect();
 
     Ok(TableInfo {
@@ -383,6 +351,209 @@ pub async fn describe_table(
         foreign_keys,
         constraints,
     })
+}
+
+/// A column from its row of `describe_table`'s query, which starts at `at`.
+fn column_from(r: &Row, at: usize) -> ColumnInfo {
+    ColumnInfo {
+        name: r.get(at),
+        native_type: r.get(at + 1),
+        nullable: r.get(at + 2),
+        default: r.get(at + 3),
+        comment: r.get(at + 4),
+    }
+}
+
+/// An index from its row, which starts at `at`.
+fn index_from(r: &Row, at: usize) -> IndexInfo {
+    IndexInfo {
+        name: r.get(at),
+        unique: r.get(at + 1),
+        primary: r.get(at + 2),
+        definition: r.get(at + 3),
+    }
+}
+
+/// A foreign key from its row, which starts at `at`.
+fn foreign_key_from(r: &Row, at: usize) -> ForeignKeyInfo {
+    ForeignKeyInfo {
+        name: r.get(at),
+        columns: r.get(at + 1),
+        referenced_schema: r.get(at + 2),
+        referenced_table: r.get(at + 3),
+        referenced_columns: r.get(at + 4),
+    }
+}
+
+/// A primary key, unique or check constraint from its row, which starts at `at`.
+fn constraint_from(r: &Row, at: usize) -> ConstraintInfo {
+    let kind: String = r.get(at + 1);
+    let kind = match kind.as_str() {
+        "p" => ConstraintKind::PrimaryKey,
+        "u" => ConstraintKind::Unique,
+        _ => ConstraintKind::Check,
+    };
+    ConstraintInfo {
+        name: Some(r.get(at)),
+        kind,
+        columns: if kind == ConstraintKind::Check {
+            Vec::new()
+        } else {
+            r.get(at + 3)
+        },
+        definition: r.get(at + 2),
+    }
+}
+
+/// The tables `describe_tables` describes, of the relation `rel` (joined to `n`, its schema):
+/// those of `list_objects` that are tables, partitioned tables or foreign tables.
+fn schema_tables(rel: &str) -> String {
+    format!(
+        "n.nspname = $1 and {rel}.relkind in ('r', 'p', 'f') and {rel}.relispartition is not true"
+    )
+}
+
+/// Every table of `schema`, each exactly as [`describe_table`] describes it, in five catalog
+/// queries instead of six per table (SpelaionDB's SDB-220): the same queries over the whole
+/// schema, each row starting with its table's name, read with the same row readers. Only on
+/// PostgreSQL's own catalog: on the servers that speak its protocol `None`, and the core
+/// describes each table as before.
+pub async fn describe_tables(
+    client: &Client,
+    catalog: Catalog,
+    schema: &str,
+) -> Result<Option<Vec<TableInfo>>> {
+    match catalog {
+        Catalog::PostgreSql => {}
+        Catalog::RisingWave | Catalog::Materialize | Catalog::CrateDb => return Ok(None),
+    }
+    let tables = schema_tables("c");
+    let objects = client
+        .query(
+            &format!("{} and {tables} order by c.relname", objects_sql(catalog)),
+            &[&schema],
+        )
+        .await
+        .map_err(map_error)?;
+    let columns = client
+        .query(
+            &format!(
+                "select c.relname::text, a.attname::text, format_type(a.atttypid, a.atttypmod),
+                        not a.attnotnull, pg_get_expr(d.adbin, d.adrelid),
+                        nullif(col_description(a.attrelid, a.attnum), '')
+                 from pg_attribute a
+                 join pg_class c on c.oid = a.attrelid
+                 join pg_namespace n on n.oid = c.relnamespace
+                 left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+                 where {tables} and a.attnum > 0 and not a.attisdropped
+                 order by c.relname, a.attnum"
+            ),
+            &[&schema],
+        )
+        .await
+        .map_err(map_error)?;
+    let indexes = client
+        .query(
+            &format!(
+                "select c.relname::text, ic.relname::text, i.indisunique, i.indisprimary,
+                        pg_get_indexdef(i.indexrelid)
+                 from pg_index i
+                 join pg_class ic on ic.oid = i.indexrelid
+                 join pg_class c on c.oid = i.indrelid
+                 join pg_namespace n on n.oid = c.relnamespace
+                 where {tables} and i.indexrelid <> i.indrelid
+                 order by c.relname, ic.relname"
+            ),
+            &[&schema],
+        )
+        .await
+        .map_err(map_error)?;
+    let foreign_keys = client
+        .query(
+            &format!(
+                "select c.relname::text, con.conname::text,
+                    array(select a.attname::text from unnest(con.conkey) with ordinality k(n, o)
+                          join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.n order by k.o),
+                    rn.nspname::text, rc.relname::text,
+                    array(select a.attname::text from unnest(con.confkey) with ordinality k(n, o)
+                          join pg_attribute a on a.attrelid = con.confrelid and a.attnum = k.n order by k.o)
+                 from pg_constraint con
+                 join pg_class c on c.oid = con.conrelid
+                 join pg_namespace n on n.oid = c.relnamespace
+                 join pg_class rc on rc.oid = con.confrelid
+                 join pg_namespace rn on rn.oid = rc.relnamespace
+                 where {tables} and con.contype = 'f'
+                 order by c.relname, con.conname"
+            ),
+            &[&schema],
+        )
+        .await
+        .map_err(map_error)?;
+    let constrained = schema_tables("t");
+    let constraints = client
+        .query(
+            &format!(
+                "select t.relname::text, c.conname::text, c.contype::text,
+                        coalesce(pg_get_constraintdef(c.oid, true),
+                                 case c.contype when 'p' then 'PRIMARY KEY' when 'u' then 'UNIQUE' end
+                                 || ' (' || array_to_string(array(
+                                     select quote_ident(a.attname)
+                                     from unnest(c.conkey) with ordinality as k(attnum, ord)
+                                     join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+                                     order by k.ord), ', ') || ')',
+                                 ''),
+                        array(select a.attname::text
+                              from unnest(c.conkey) with ordinality as k(attnum, ord)
+                              join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+                              order by k.ord)
+                 from pg_constraint c
+                 join pg_class t on t.oid = c.conrelid
+                 join pg_namespace n on n.oid = t.relnamespace
+                 where {constrained} and c.contype in ('p', 'u', 'c')
+                 order by t.relname, c.contype <> 'p', c.conname"
+            ),
+            &[&schema],
+        )
+        .await
+        .map_err(map_error)?;
+
+    // Each table's rows of one query, in the query's order; the name is the first column.
+    fn grouped<T>(rows: &[Row], read: fn(&Row, usize) -> T) -> HashMap<String, Vec<T>> {
+        let mut by_table: HashMap<String, Vec<T>> = HashMap::new();
+        for row in rows {
+            by_table
+                .entry(row.get::<_, String>(0))
+                .or_default()
+                .push(read(row, 1));
+        }
+        by_table
+    }
+    let mut columns = grouped(&columns, column_from);
+    let mut indexes = grouped(&indexes, index_from);
+    let mut foreign_keys = grouped(&foreign_keys, foreign_key_from);
+    let mut constraints = grouped(&constraints, constraint_from);
+    objects
+        .iter()
+        .map(|row| {
+            let object = object_from_row(row)?;
+            let name = object.name.clone();
+            let constraints = constraints.remove(&name).unwrap_or_default();
+            let primary_key = constraints
+                .iter()
+                .find(|c| c.kind == ConstraintKind::PrimaryKey)
+                .map(|c| c.columns.clone())
+                .unwrap_or_default();
+            Ok(TableInfo {
+                object,
+                columns: columns.remove(&name).unwrap_or_default(),
+                primary_key,
+                indexes: indexes.remove(&name).unwrap_or_default(),
+                foreign_keys: foreign_keys.remove(&name).unwrap_or_default(),
+                constraints,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 /// CrateDB's primary key and constraints: each constraint from `pg_constraint`, with the

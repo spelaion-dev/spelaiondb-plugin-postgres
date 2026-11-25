@@ -34,6 +34,11 @@ says only what is different in this repository.
   template, with `CONNECT`; SpelaionDB's ADR-074), on PostgreSQL's catalog only;
   `select_database` stays unsupported: another database is another session
   (`tests/databases.rs`).
+  `describe_tables` (protocol 1.4, SpelaionDB's SDB-220) is every table of a schema in five
+  catalog queries, read with the same row readers as `describe_table` so the two cannot differ
+  (`tests/postgres.rs` compares them table by table, and so does SpelaionDB's conformance set);
+  on PostgreSQL's own catalog only: RisingWave, Materialize and CrateDB answer `None`, and the
+  core describes each table.
   Materialize's sinks, connections and secrets (schema objects) and clusters and replicas
   (server objects) are protocol 1.3's kinds (SpelaionDB's ADR-082), read from `mz_catalog`; a
   secret's value is never read and it has no definition. The sink part of

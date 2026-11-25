@@ -478,6 +478,11 @@ impl Connection for PgConnection {
         introspect::list_columns(&self.client, schema).await
     }
 
+    async fn describe_tables(&self, schema: &str) -> Result<Option<Vec<TableInfo>>> {
+        let _permit = self.lock_sql().await?;
+        introspect::describe_tables(&self.client, self.catalog().await?, schema).await
+    }
+
     async fn list_referencing_keys(&self, schema: &str, name: &str) -> Result<Vec<ReferencingKey>> {
         let _permit = self.lock_sql().await?;
         introspect::list_referencing_keys(&self.client, self.catalog().await?, schema, name).await

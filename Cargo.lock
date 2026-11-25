@@ -510,7 +510,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1135,7 +1135,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1349,8 +1349,8 @@ dependencies = [
 
 [[package]]
 name = "spelaion-dialect"
-version = "0.15.0"
-source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.4.1#0395784b199e9c46c6167a19b8587eef007246ec"
+version = "0.16.0"
+source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.5.0#7f79b60b58df52b93f74d1f2217b4305234e56f6"
 dependencies = [
  "serde_json",
  "spelaion-driver-api",
@@ -1358,8 +1358,8 @@ dependencies = [
 
 [[package]]
 name = "spelaion-driver-api"
-version = "0.15.0"
-source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.4.1#0395784b199e9c46c6167a19b8587eef007246ec"
+version = "0.16.0"
+source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.5.0#7f79b60b58df52b93f74d1f2217b4305234e56f6"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1372,8 +1372,8 @@ dependencies = [
 
 [[package]]
 name = "spelaion-plugin-host"
-version = "0.15.0"
-source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.4.1#0395784b199e9c46c6167a19b8587eef007246ec"
+version = "0.16.0"
+source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.5.0#7f79b60b58df52b93f74d1f2217b4305234e56f6"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1389,8 +1389,8 @@ dependencies = [
 
 [[package]]
 name = "spelaion-plugin-protocol"
-version = "0.15.0"
-source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.4.1#0395784b199e9c46c6167a19b8587eef007246ec"
+version = "0.16.0"
+source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.5.0#7f79b60b58df52b93f74d1f2217b4305234e56f6"
 dependencies = [
  "arrow",
  "serde",
@@ -1401,8 +1401,8 @@ dependencies = [
 
 [[package]]
 name = "spelaion-plugin-sdk"
-version = "0.15.0"
-source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.4.1#0395784b199e9c46c6167a19b8587eef007246ec"
+version = "0.16.0"
+source = "git+https://github.com/spelaion-dev/spelaiondb?tag=plugin-sdk-v0.5.0#7f79b60b58df52b93f74d1f2217b4305234e56f6"
 dependencies = [
  "arrow",
  "futures-util",
@@ -1495,7 +1495,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
